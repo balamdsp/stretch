@@ -375,6 +375,7 @@ public:
     }
 
     std::function<void()> onSetExportFolder;
+    std::function<void()> onViewStateChanged;
 
 private:
     void timerCallback() override
@@ -550,7 +551,13 @@ private:
         const int presetIndex = selectedId - kPresetBaseId;
         if (presetIndex >= 0 && presetIndex < presetPaths.size())
         {
-            StretchPresets::load (presetPaths[presetIndex], processor.parameters);
+            StretchPresets::ViewState vs;
+            StretchPresets::load (presetPaths[presetIndex], processor.parameters, vs);
+            processor.setWaveViewStart (vs.viewStart);
+            processor.setWaveViewLen (vs.viewLen);
+            processor.setLoopRegion (vs.loopStart, vs.loopEnd);
+            if (onViewStateChanged)
+                onViewStateChanged();
             return;
         }
 
@@ -624,7 +631,13 @@ private:
                 if (safeThis == nullptr || name.trim().isEmpty())
                     return;
 
-                if (! StretchPresets::save (safeThis->processor.parameters, name))
+                StretchPresets::ViewState views;
+                views.viewStart = safeThis->processor.getWaveViewStart();
+                views.viewLen   = safeThis->processor.getWaveViewLen();
+                views.loopStart = safeThis->processor.getLoopStart();
+                views.loopEnd   = safeThis->processor.getLoopEnd();
+
+                if (! StretchPresets::save (safeThis->processor.parameters, name, views))
                     StretchExportDialogs::openWindow (
                         new StretchExportDialog (">> PRESETS",
                             "Failed to save the preset.\nCheck disk space / permissions.",

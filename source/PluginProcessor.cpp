@@ -478,6 +478,15 @@ void StretchAudioProcessor::installLoadedFile (juce::AudioBuffer<float>&& decode
             engine.prepare (sampleRate, juce::jmax (1, getTotalNumOutputChannels()));
 
         engine.setSource (originalBuffer, sampleRate);
+
+        if (! pendingViewStateRestore)
+        {
+            waveViewStart.store (0.0);
+            waveViewLen.store (1.0);
+            loopStart.store (0.0);
+            loopEnd.store (1.0);
+        }
+        pendingViewStateRestore = false;
     }
 
     pendingSeek.store (0);
@@ -900,6 +909,13 @@ void StretchAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     // large to live in plugin state).
     tree.setProperty ("SourcePath", sourceFile.getFullPathName(), nullptr);
 
+    // Waveform view + loop region: so editor open/close and presets
+    // preserve scroll, zoom and selection.
+    tree.setProperty ("WaveViewStart", waveViewStart.load(), nullptr);
+    tree.setProperty ("WaveViewLen",  waveViewLen.load(), nullptr);
+    tree.setProperty ("LoopStart",   loopStart.load(), nullptr);
+    tree.setProperty ("LoopEnd",     loopEnd.load(), nullptr);
+
     // NOTE: the export folder is deliberately NOT saved here — it lives in
     // the system-wide settings file so all formats/instances share one value.
     juce::MemoryOutputStream stream;
@@ -942,6 +958,15 @@ void StretchAudioProcessor::setStateInformation (const void* data, int sizeInByt
         if (tree.hasProperty ("Rewinded"))
             setReversed ((bool) tree.getProperty ("Rewinded", false));
 
+        // Waveform view + loop region. The editor re-syncs from these below.
+        if (tree.hasProperty ("WaveViewStart"))
+            setWaveViewStart ((double) tree.getProperty ("WaveViewStart", 0.0));
+        if (tree.hasProperty ("WaveViewLen"))
+            setWaveViewLen ((double) tree.getProperty ("WaveViewLen", 1.0));
+        if (tree.hasProperty ("LoopStart") && tree.hasProperty ("LoopEnd"))
+            setLoopRegion ((double) tree.getProperty ("LoopStart", 0.0),
+                           (double) tree.getProperty ("LoopEnd", 1.0));
+
         // Project recall: re-request the referenced source through the
         // async load path. Missing files are skipped silently; a state
         // without a usable path leaves this instance empty.
@@ -950,10 +975,18 @@ void StretchAudioProcessor::setStateInformation (const void* data, int sizeInByt
 
         if (file.existsAsFile())
         {
-            // Skip redundant reloads: hosts may replay an identical state
-            // repeatedly (autosave restore, template re-open).
             if (! (hasLoadedFile() && file == sourceFile))
+            {
+                pendingViewStateRestore = true;  // keep restored view on the reload
                 loadAudioFile (file);
+            }
+            else
+            {
+                pendingViewStateRestore = false;
+                auto cb = onViewStateRestored;
+                if (cb)
+                    juce::MessageManager::callAsync ([cb] { cb(); });
+            }
         }
         else if (hasLoadedFile())
         {

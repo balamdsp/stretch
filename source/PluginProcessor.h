@@ -96,6 +96,13 @@ public:
     double getLoopStart() const noexcept { return loopStart.load(); }
     double getLoopEnd() const noexcept { return loopEnd.load(); }
 
+    double getWaveViewStart() const noexcept { return waveViewStart.load(); }
+    double getWaveViewLen()  const noexcept { return waveViewLen.load(); }
+    void setWaveViewStart (double s) noexcept { waveViewStart.store (juce::jlimit (0.0, 1.0, s)); }
+    void setWaveViewLen  (double l) noexcept { waveViewLen.store (juce::jlimit (0.0, 1.0, l)); }
+
+    std::function<void()> onViewStateRestored;
+
     // Current RATE parameter as a raw multiplier (1.0 = 100 %).
     float getRateValue() const
     {
@@ -249,6 +256,8 @@ private:
     std::atomic<bool> looping { true };
     std::atomic<double> loopStart { 0.0 };     // loop region (fractions 0..1)
     std::atomic<double> loopEnd { 1.0 };
+    std::atomic<double> waveViewStart { 0.0 };  // waveform scroll position
+    std::atomic<double> waveViewLen  { 1.0 };   // waveform zoom level
     std::atomic<int64_t> playPosition { 0 };   // source-domain samples (device rate)
     std::atomic<int64_t> pendingSeek { -1 };
     std::atomic<double> transportFraction { 0.0 };
@@ -269,6 +278,11 @@ private:
 
     std::atomic<double> exportProgress { 0.0 };
     std::atomic<bool> exportCancelFlag { false };
+
+    // Written by setStateInformation (message thread) before a file reload,
+    // read once by installLoadedFile (worker thread) to decide whether to
+    // reset the view state.
+    std::atomic<bool> pendingViewStateRestore { false };
 
     // Declared LAST so they are destroyed FIRST (before engine/buffers they
     // touch); the destructor also joins them explicitly.

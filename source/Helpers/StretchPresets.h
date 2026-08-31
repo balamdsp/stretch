@@ -19,6 +19,16 @@ namespace StretchPresets
         "PitchSemitones", "TimeRatio", "FormantPreserve", "FormantSemitones", "OutputGain"
     };
 
+    // Waveform view + loop region captured alongside the automatable params,
+    // so a preset restores scroll, zoom and selection too.
+    struct ViewState
+    {
+        double viewStart = 0.0;
+        double viewLen  = 1.0;
+        double loopStart = 0.0;
+        double loopEnd   = 1.0;
+    };
+
     inline juce::File presetsFolder()
     {
         auto dir = juce::File::getSpecialLocation (
@@ -40,7 +50,8 @@ namespace StretchPresets
 
     // Filesystem-hostile characters are stripped; empty result is rejected.
     inline bool save (const juce::AudioProcessorValueTreeState& apvts,
-                      const juce::String& rawName)
+                      const juce::String& rawName,
+                      const ViewState& vs = {})
     {
         const juce::String safe = rawName.trim()
             .retainCharacters ("abcdefghijklmnopqrstuvwxyz"
@@ -56,6 +67,11 @@ namespace StretchPresets
             if (auto* p = apvts.getParameter (id))
                 tree.setProperty (juce::Identifier (id), p->getValue(), nullptr);
 
+        tree.setProperty ("WaveViewStart", vs.viewStart, nullptr);
+        tree.setProperty ("WaveViewLen",  vs.viewLen, nullptr);
+        tree.setProperty ("LoopStart",    vs.loopStart, nullptr);
+        tree.setProperty ("LoopEnd",      vs.loopEnd, nullptr);
+
         const auto xml = tree.createXml();
         if (xml == nullptr)
             return false;
@@ -65,7 +81,8 @@ namespace StretchPresets
 
     // Unknown/stale ids are skipped so older presets survive changes to the
     // parameter set. Missing file or malformed XML is a silent no-op.
-    inline void load (const juce::File& file, juce::AudioProcessorValueTreeState& apvts)
+    inline void load (const juce::File& file, juce::AudioProcessorValueTreeState& apvts,
+                      ViewState& vs)
     {
         auto xml = juce::parseXML (file);
         if (xml == nullptr || ! xml->hasTagName ("StretchPreset"))
@@ -81,5 +98,10 @@ namespace StretchPresets
             if (auto* p = apvts.getParameter (id))
                 p->setValueNotifyingHost ((float) (double) tree.getProperty (id, 0.0));
         }
+
+        vs.viewStart  = (double) tree.getProperty ("WaveViewStart", 0.0);
+        vs.viewLen    = (double) tree.getProperty ("WaveViewLen", 1.0);
+        vs.loopStart  = (double) tree.getProperty ("LoopStart", 0.0);
+        vs.loopEnd    = (double) tree.getProperty ("LoopEnd", 1.0);
     }
 }

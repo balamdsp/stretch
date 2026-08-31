@@ -58,9 +58,14 @@ public:
         buildPeakMips();
         unloadButton.setVisible (! thumbnailSamples.isEmpty());
 
-        // Fresh source: reset the view and any stale selection.
-        resetView();
-        clearSelection();
+        // Local reset only — don't push to the processor, which holds the
+        // persisted view/loop (preserved across editor recreation, or already
+        // defaulted by installLoadedFile for a brand-new file).
+        viewStart = 0.0;
+        viewLen = 1.0;
+        selStart = 0.0;
+        selEnd = 0.0;
+        restoreFromProcessor();
 
         repaint();
     }
@@ -73,6 +78,27 @@ public:
         unloadButton.setVisible (false);
         resetView();
         clearSelection();
+        repaint();
+    }
+
+    // Re-apply view + selection from the processor (survives editor
+    // recreation and host state restore). Call after setBuffer().
+    void restoreFromProcessor()
+    {
+        viewLen  = juce::jlimit (kMinViewLen, 1.0, processor.getWaveViewLen());
+        viewStart = juce::jlimit (0.0, 1.0 - viewLen, processor.getWaveViewStart());
+
+        const double ls = processor.getLoopStart();
+        const double le = processor.getLoopEnd();
+        // Processor (0,1) is the "no selection" sentinel (matches
+        // clearSelection), so only a real sub-range is applied.
+        if (ls > 0.0 || le < 1.0)
+        {
+            selStart = ls;
+            selEnd = le;
+        }
+
+        rebuildViewPeaks();
         repaint();
     }
 
@@ -379,6 +405,8 @@ private:
     void scrollToStart (double s)
     {
         viewStart = juce::jlimit (0.0, 1.0 - viewLen, s);
+        processor.setWaveViewStart (viewStart);
+        processor.setWaveViewLen (viewLen);
         rebuildViewPeaks();
     }
 
@@ -391,6 +419,8 @@ private:
     {
         viewStart = 0.0;
         viewLen = 1.0;
+        processor.setWaveViewStart (0.0);
+        processor.setWaveViewLen (1.0);
         rebuildViewPeaks();
     }
 

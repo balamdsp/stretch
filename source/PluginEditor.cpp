@@ -24,6 +24,11 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
         onSetExportFolder();
     };
 
+    screen.topPanel.onViewStateChanged = [this]
+    {
+        screen.mainPanel.waveform.restoreFromProcessor();
+    };
+
     // Loads complete off-thread; the callback arrives on the message
     // thread. SafePointer guards the gap where this editor is destroyed
     // while a decode is still in flight.
@@ -40,14 +45,32 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
             safeThis->screen.mainPanel.waveform.setBuffer (
                 safeThis->processor.getOriginalBuffer(),
                 safeThis->processor.getFileSampleRate());
+            safeThis->screen.mainPanel.waveform.restoreFromProcessor();
         });
     };
 
     // Editor may be (re)created long after a file was loaded (host recreates
     // UI, session reload): seed the waveform from the live processor buffer.
     if (processor.hasLoadedFile())
+    {
         screen.mainPanel.waveform.setBuffer (processor.getOriginalBuffer(),
                                              processor.getFileSampleRate());
+        screen.mainPanel.waveform.restoreFromProcessor();
+    }
+
+    // Host state restore for an already-loaded, unchanged file reaches the
+    // editor here rather than through the async load path.
+    processor.onViewStateRestored = [safeThis = juce::Component::SafePointer<StretchAudioProcessorEditor> (this)]
+    {
+        if (safeThis == nullptr)
+            return;
+        juce::MessageManager::callAsync ([safeThis]
+        {
+            if (safeThis == nullptr)
+                return;
+            safeThis->screen.mainPanel.waveform.restoreFromProcessor();
+        });
+    };
 
     setSize (STRETCH_PANEL_WIDTH, STRETCH_PANEL_HEIGHT);
 
