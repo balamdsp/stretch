@@ -1,0 +1,120 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            configure: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTRETCH_COPY_AFTER_BUILD=OFF
+          - name: macos
+            os: macos-latest
+            configure: cmake -B build -G Xcode -DCMAKE_BUILD_TYPE=Release -DSTRETCH_COPY_AFTER_BUILD=OFF -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          - name: linux
+            os: ubuntu-latest
+            configure: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTRETCH_COPY_AFTER_BUILD=OFF
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libjack-jackd2-dev \
+            ladspa-sdk libcurl4-openssl-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libglu1-mesa-dev mesa-common-dev libgtk-3-dev
+
+      - name: Configure
+        run: ${{ matrix.configure }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Upload artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stretch-windows
+          path: |
+            build/StretchPlugin_artefacts/Release/VST3/Stretch.vst3
+            build/StretchPlugin_artefacts/Release/CLAP/Stretch.clap
+            build/StretchPlugin_artefacts/Release/Standalone/Stretch.exe
+
+      - name: Upload artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stretch-macos
+          path: |
+            build/StretchPlugin_artefacts/Release/VST3/Stretch.vst3
+            build/StretchPlugin_artefacts/Release/CLAP/Stretch.clap
+            build/StretchPlugin_artefacts/Release/Standalone/Stretch.app
+
+      - name: Upload artifacts (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stretch-linux
+          path: |
+            build/StretchPlugin_artefacts/Release/VST3/Stretch.vst3
+            build/StretchPlugin_artefacts/Release/CLAP/Stretch.clap
+            build/StretchPlugin_artefacts/Release/Standalone/Stretch
+
+  release:
+    name: Release
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Zip per-platform folders
+        run: |
+          cd dist
+          for d in Stretch-*/; do
+            (cd "$d" && zip -qr "../${d%/}-${{ steps.version.outputs.version }}.zip" .)
+          done
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') }}
