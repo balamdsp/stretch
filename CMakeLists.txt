@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(StretchPlugin VERSION 1.0.1 LANGUAGES C CXX)
+project(StretchPlugin VERSION 1.0.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,14 +76,20 @@ juce_add_plugin(StretchPlugin
     IS_MIDI_EFFECT FALSE
     IS_SYNTH FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
-    VST3_CATEGORIES "Fx" "Pitch Shift"
+    VST3_CATEGORIES "Fx" "Instrument" "Pitch Shift"
 )
 
 # Source files (StretchEngine is header-only)
 target_sources(StretchPlugin PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
+    source/Helpers/StretchFrameExtents.cpp
 )
+
+# StretchFrameExtents.cpp talks Xlib directly (Linux standalone frame).
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(StretchPlugin PRIVATE X11)
+endif()
 
 # Binary data (font)
 juce_add_binary_data(StretchPluginData
@@ -116,9 +122,10 @@ target_compile_definitions(StretchPlugin
         JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0
         JUCE_DISPLAY_SPLASH_SCREEN=0
-        # Off keeps the UI at 1:1 physical scaling (CRT_UI_RESIZE.md §8).
-        JUCE_WIN_PER_MONITOR_DPI_AWARE=0
         JUCE_STRICT_REFCOUNTEDPOINTER=1
+        # On: the empty-drop-area picker and recent-files menu advertise MP3,
+        # and registerBasicFormats() only registers its MP3 reader with this.
+        JUCE_USE_MP3AUDIOFORMAT=1
 )
 
 # NOTE: do NOT try to force JUCE_STANDALONE_APPLICATION=0 here. Plugin
@@ -149,5 +156,5 @@ endif()
 # Stretch.clap next to the other artefacts, under .../CLAP).
 clap_juce_extensions_plugin(TARGET StretchPlugin
     CLAP_ID "com.balamdsp.Stretch"
-    CLAP_FEATURES "audio-effect"
+    CLAP_FEATURES "audio-effect" "instrument" "sampler"
 )

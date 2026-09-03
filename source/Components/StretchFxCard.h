@@ -7,10 +7,7 @@
 #include "StretchTransportCard.h"
 #include "../PluginProcessor.h"
 
-// ---------------------------------------------------------------------------
-// StretchFxTextButton - bracketed terminal-style button rendered at a size
-// that fits long labels like FORMANT PRESERVE inside a 190px card row.
-// ---------------------------------------------------------------------------
+// Bracketed terminal button; shrink-to-fit for long labels at any zoom.
 class StretchFxTextButton : public juce::TextButton
 {
 public:
@@ -25,22 +22,43 @@ public:
         const bool on = getToggleState();
         const bool hot = isMouseOver() || isDown();
         const float s = Zoom::uiScale;
-        g.setFont (StretchLookAndFeel::makeFont (20.0f * s));
-        g.setColour ((on || hot) ? textPrimary : textMid);
 
-        const juce::String text = on ? ("> " + getButtonText() + " <")
-                                     : ("[ " + getButtonText() + " ]");
-        g.drawText (text, getLocalBounds().toFloat().translated (0, -juce::roundToInt (2.0f * s)),
+        const juce::String label = on ? ("> " + getButtonText() + " <")
+                                      : ("[ " + getButtonText() + " ]");
+
+        // Shrink-to-fit so long labels never clip; floor keeps text readable.
+        float fontH = kButtonFontPx * s;
+        auto font = StretchLookAndFeel::makeFont (fontH);
+        const float maxW = (float) getWidth() - 8.0f * s;
+
+        for (int i = 0; i < 16 && fontH > kButtonFontFloorPx * s
+                        && maxW > 0.0f && juce::GlyphArrangement::getStringWidth (font, label) > maxW; ++i)
+        {
+            fontH -= 0.5f * s;
+            font = StretchLookAndFeel::makeFont (fontH);
+        }
+
+        g.setFont (font);
+        const auto base = (on || hot) ? textPrimary : textMid;
+        g.setColour (isEnabled() ? base : base.withAlpha (0.35f));
+
+        // DirectWrite centres lower than FreeType; nudge up on Windows.
+       #if JUCE_WINDOWS
+        const auto textArea = getLocalBounds().toFloat().translated (0.0f, -2.0f * s);
+       #else
+        const auto textArea = getLocalBounds().toFloat();
+       #endif
+        g.drawText (label, textArea,
                     juce::Justification::centred, true);
     }
+
+private:
+    static constexpr float kButtonFontPx = 18.0f;
+    static constexpr float kButtonFontFloorPx = 12.0f;
 };
 
-// ---------------------------------------------------------------------------
-// StretchFxCard - PRESERVE / FREEZE / REWIND laid out like the transport
-// card: outer dark card, inner card, title strip, three equal FlexBox rows.
-// All three toggles ride APVTS parameters via ButtonParameterAttachment, so
-// host automation, keyboard shortcuts and the buttons stay in sync.
-// ---------------------------------------------------------------------------
+// PRESERVE / FREEZE / REWIND card. Toggles ride APVTS params, so host,
+// shortcuts and buttons stay in sync.
 class StretchFxCard : public juce::Component
 {
 public:
@@ -59,10 +77,7 @@ public:
         freezeAttachment = std::make_unique<juce::ButtonParameterAttachment> (
             *p.parameters.getParameter ("Freeze"), freezeButton);
 
-        // REWIND is a latching reverse-playback toggle: while engaged the
-        // RATE sign flips, so the material plays backwards at the same rate.
-        // No seeking is involved -- under FREEZE it simply changes nothing
-        // audibly (stillness) and never disturbs playback.
+        // REWIND latches reverse; under FREEZE it's inaudible stillness.
         rewindButton.setClickingTogglesState (true);
         addAndMakeVisible (rewindButton);
         rewindAttachment = std::make_unique<juce::ButtonParameterAttachment> (
@@ -100,7 +115,6 @@ public:
         auto area = getLocalBounds()
                         .reduced (juce::roundToInt (GUI::Layout::CardInset() + GUI::Layout::ContentInset()));
 
-        // Title strip: 5 px down + 16 px text, matching the paint() inset.
         area.removeFromTop (m.sc (kTitleInsetPx) + m.sc (kTitleHeightPx));
 
         const float rowGap = 7.0f * s;

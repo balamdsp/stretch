@@ -5,10 +5,7 @@
 #include "../Helpers/StretchLookAndFeel.h"
 #include "../PluginProcessor.h"
 
-// ---------------------------------------------------------------------------
-// StretchIconButton - boxed transport button with a hand-drawn vector glyph:
-// play triangle (morphs into pause bars), stop square, loop arrow.
-// ---------------------------------------------------------------------------
+// Boxed transport button with a vector glyph (play morphs to pause).
 class StretchIconButton : public juce::TextButton
 {
 public:
@@ -37,8 +34,7 @@ public:
         const bool bright = getToggleState() || isMouseOver() || isDown();
         g.setColour (bright ? StretchColors::textPrimary : StretchColors::textMid);
 
-        // Glyphs are drawn about the button's centre; every constant scales
-        // with the current UI zoom so icons stay proportional at any size.
+        // Glyphs centre on the button; all constants scale with zoom.
         const float s = Zoom::uiScale;
 
         auto b = getLocalBounds().toFloat().reduced (10.0f * s);
@@ -69,7 +65,6 @@ public:
             }
             case Glyph::Rewind:
             {
-                // Double left-pointing triangles (rewind / scrub back).
                 juce::Path head;
                 head.addTriangle (cx + 6.0f * s, cy - 7.0f * s,
                                   cx + 6.0f * s, cy + 7.0f * s,
@@ -91,9 +86,7 @@ public:
             }
             case Glyph::Loop:
             {
-                // Circular arrow: open ring + head. Note: the ring radius and
-                // head angles are scale-independent; only offsets/strokes move
-                // with the zoom.
+                // Open ring + head; radius/angles fixed, strokes scale.
                 const float r = 7.5f * s;
                 juce::Path ring;
                 ring.addCentredArc (cx, cy, r, r, 0.0f,
@@ -116,7 +109,6 @@ public:
             }
             case Glyph::Plus:
             {
-                // Smaller strokes for the compact waveform-zoom cluster.
                 g.drawLine (cx - 5.0f * s, cy, cx + 5.0f * s, cy, 2.0f * s);
                 g.drawLine (cx, cy - 5.0f * s, cx, cy + 5.0f * s, 2.0f * s);
                 break;
@@ -128,7 +120,7 @@ public:
             }
             case Glyph::Fit:
             {
-                // Bracket pair with a centre bar ("zoom to fit").
+                // Bracket pair + centre bar.
                 g.drawLine (cx - 7.0f * s, cy - 5.0f * s, cx - 7.0f * s, cy + 5.0f * s, 1.8f * s);
                 g.drawLine (cx - 7.0f * s, cy - 5.0f * s, cx - 3.5f * s, cy - 5.0f * s, 1.8f * s);
                 g.drawLine (cx - 7.0f * s, cy + 5.0f * s, cx - 3.5f * s, cy + 5.0f * s, 1.8f * s);
@@ -147,9 +139,7 @@ private:
     Glyph glyph;
 };
 
-// ---------------------------------------------------------------------------
-// StretchTransportCard - PLAY / STOP / LOOP as three equal FlexBox rows.
-// ---------------------------------------------------------------------------
+// PLAY / STOP / LOOP as three FlexBox rows.
 class StretchTransportCard : public juce::Component,
                              private juce::Timer
 {
@@ -204,10 +194,9 @@ public:
         auto area = getLocalBounds()
                         .reduced (juce::roundToInt (GUI::Layout::CardInset() + GUI::Layout::ContentInset()));
 
-        // Title strip: 5 px down + 16 px text, matching the paint() inset.
         area.removeFromTop (m.sc (kTitleInsetPx) + m.sc (kTitleHeightPx));
 
-        // Three equal rows, explicitly sized FlexItems (cannot collapse to zero).
+        // Equal rows; explicit sizes so FlexItems can't collapse to zero.
         const float rowGap = 7.0f * s;
         const float rowH = (area.getHeight() - 2.0f * rowGap) / 3.0f;
 
@@ -227,7 +216,7 @@ public:
 private:
     void timerCallback() override
     {
-        // Keep glyphs honest even when the transport changes elsewhere.
+        // Transport can change elsewhere (shortcuts, host).
         playButton.setGlyph (processor.isPlaying()
             ? StretchIconButton::Glyph::Pause
             : StretchIconButton::Glyph::Play);

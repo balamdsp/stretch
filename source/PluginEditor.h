@@ -30,35 +30,51 @@ public:
         if (topLevelIsWindow)
             return;
 
-        // The standalone window is a DocumentWindow -> ResizableWindow; hosts
-        // that wrap the editor in their own ResizableWindow are recoloured too
-        // (no-op elsewhere, since dynamic_cast simply fails).
+        // Recolour host ResizableWindow wrappers too (dynamic_cast no-ops).
         //
-        // NOTE: do NOT call setUsingNativeTitleBar() here. This fires mid-way
-        // through StandaloneFilterWindow::updateContent(), before the wrapper
-        // has fitted the window to the editor, so recreating the peer at that
-        // moment leaves the standalone stuck at the DocumentWindow's initial
-        // 128x128 minimum -- and it also hides the built-in Options button.
+        // NOTE: no setUsingNativeTitleBar() here: fires mid-updateContent(),
+        // recreating the peer then sticks standalone at 128x128 minimum.
         if (auto* sfw = dynamic_cast<juce::ResizableWindow*> (getTopLevelComponent()))
         {
             topLevelIsWindow = true;
             sfw->setColour (juce::ResizableWindow::backgroundColourId, GUI::Color::Background);
 
-            // The window size tracks the editor (applyZoom's top-level setSize),
-            // so free user drag-resize is disabled.
-            sfw->setResizable (false, false);
-
-            // Windows only: force 1:1 physical scaling so the plugin shell never
-            // gets scaled by an OS display scale (CRT_UI_RESIZE.md §8).
-           #if JUCE_WINDOWS
-            if (auto* peer = getPeer())
-                peer->setCustomPlatformScaleFactor (1.0f);
-           #endif
+            // X11 size lock: peer keeps windowIsResizable or WM hides hints;
+            // min==max constrainer pins do the locking. Hosts use legacy path.
+            juce::Component::SafePointer<juce::ResizableWindow> safeSfw { sfw };
+            juce::Component::SafePointer<StretchAudioProcessorEditor> safeThis { this };
+            juce::MessageManager::callAsync ([safeSfw, safeThis]
+            {
+                if (safeSfw == nullptr || safeThis == nullptr)
+                    return;
+                const int w = juce::roundToInt (Zoom::BaseW * safeThis->uiScale);
+                const int h = juce::roundToInt (Zoom::BaseH * safeThis->uiScale);
+                if (safeThis->processor.isRunningAsStandalone())
+                {
+                    if (! safeSfw->isResizable())
+                        safeSfw->setResizable (true, false);
+                    safeSfw->setUsingNativeTitleBar (true); // no-op if already set
+                    // Outer accounting (see applyZoom): live frame in.
+                    const auto frame = getNativeFrameSize (safeSfw.getComponent());
+                    const int outerW = juce::jmax (1, w + frame.x);
+                    const int outerH = juce::jmax (1, h + frame.y);
+                    if (auto* c = safeSfw->getConstrainer())
+                        c->setSizeLimits (outerW, outerH, outerW, outerH);
+                    safeThis->setSize (w, h);
+                    safeSfw->setSize (outerW, outerH);
+                }
+                else
+                {
+                    safeSfw->setUsingNativeTitleBar (true); // no-op if already set
+                    safeSfw->setResizable (false, false);
+                    safeSfw->setSize (w, h);
+                }
+            });
+            // OS scale stays; Zoom::uiScale multiplies on top.
         }
     }
 
-    // Zoom engine: the only way the window size changes. Read from the
-    // persisted "ui_scale" APVTS choice parameter -> applyZoom.
+    // Zoom engine: persisted "ui_scale" param -> applyZoom.
     void applyZoom (float scale);
     void parameterChanged (const juce::String& parameterID, float newValue) override;
 
@@ -109,6 +125,9 @@ private:
 
     void onFileDropped (const juce::File& file);
     void onSetExportFolder();
+
+    // Native-frame extents (L+R, T+B); (0,0) when n/a or unknown.
+    static juce::Point<int> getNativeFrameSize (juce::Component* topLevelWindow);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchAudioProcessorEditor)
 };

@@ -5,10 +5,7 @@
 #include "../Helpers/StretchDefines.h"
 #include "../Helpers/StretchLookAndFeel.h"
 
-// ---------------------------------------------------------------------------
-// StretchControls - PITCH / RATE / FORMANT rows:
-// dim label above a LinearHorizontal track with the value box on the right.
-// ---------------------------------------------------------------------------
+// PITCH / RATE / FORMANT rows: dim label over a track + right value box.
 class StretchControls : public juce::Component
 {
 public:
@@ -21,11 +18,8 @@ public:
                                           std::unique_ptr<juce::Label>& nameLabel)
         {
             slider = std::make_unique<juce::Slider> (juce::Slider::LinearHorizontal,
-                                                      juce::Slider::TextBoxRight);
-            // Explicit L&F: sliders constructed before the editor installs the
-            // global one would otherwise keep the stock-V4 textbox (teal
-            // selection). Setting this forces lookAndFeelChanged, rebuilding
-            // the value box through our factory.
+                                                       juce::Slider::TextBoxRight);
+            // Explicit L&F: pre-editor sliders would keep the stock textbox.
             slider->setLookAndFeel (&sliderLookAndFeel());
             slider->setTextBoxStyle (juce::Slider::TextBoxRight, false, 124, 24);
             slider->setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
@@ -36,7 +30,7 @@ public:
 
             nameLabel = std::make_unique<juce::Label> ("", label);
             nameLabel->setJustificationType (juce::Justification::centredLeft);
-            nameLabel->setFont (StretchLookAndFeel::makeFont (19.0f * Zoom::uiScale));
+            nameLabel->setFont (StretchLookAndFeel::makeFont (kLabelFontPx * Zoom::uiScale));
             nameLabel->setColour (juce::Label::textColourId,
                                   GUI::Color::Logo.withAlpha (0.5f));
             addAndMakeVisible (*nameLabel);
@@ -49,7 +43,7 @@ public:
 
     ~StretchControls() override
     {
-        // Component::setLookAndFeel does NOT take ownership (ERRATA.md).
+        // setLookAndFeel takes no ownership.
         pitchSlider->setLookAndFeel (nullptr);
         timeSlider->setLookAndFeel (nullptr);
         formantSlider->setLookAndFeel (nullptr);
@@ -86,18 +80,16 @@ public:
         auto area = getLocalBounds()
                         .reduced (juce::roundToInt (GUI::Layout::CardInset() + GUI::Layout::ContentInset()));
 
-        // Title strip: 5 px down + 16 px text, matching the paint() inset.
         area.removeFromTop (m.sc (kTitleInsetPx) + m.sc (kTitleHeightPx));
 
         const float labelHeight = 18.0f * s;
-        // Taller than the visible track: the value box trims its bottom in
-        // the L&F layout so its text optically centres against the track.
-        // 42 gives the box a 37px (42 - 5 trim) tall readout at 100%.
+        // Taller than the track: the L&F trims the box bottom to centre text.
+        // 42px gives a 37px readout at 100%.
         const float sliderHeight = 42.0f * s;
         const float rowGap = 14.0f * s;
         const float rowHeight = labelHeight + 2.0f * s + sliderHeight;
 
-        // Centre the three rows vertically in what remains of the card.
+        // Centre the three rows in the remaining card space.
         const float rowsTotal = 3.0f * rowHeight + 2.0f * rowGap;
         area.removeFromTop (juce::jmax (0.0f, (area.getHeight() - rowsTotal) * 0.5f));
 
@@ -124,14 +116,12 @@ public:
         }
     }
 
-    // Zoom hook (called by the editor's applyScaledFonts): the name labels and
-    // value boxes carry explicit fonts/sizes, so they are re-set for the new
-    // zoom here instead of relying on the L&F.
+    // Zoom hook: labels/boxes have explicit fonts/sizes; re-set them here.
     void applyFontScale (float scale)
     {
         for (auto* l : { pitchLabel.get(), timeLabel.get(), formantLabel.get() })
             if (l != nullptr)
-                l->setFont (StretchLookAndFeel::makeFont (19.0f * scale));
+                l->setFont (StretchLookAndFeel::makeFont (kLabelFontPx * scale));
 
         const int boxW = juce::roundToInt (124.0f * scale);
         const int boxH = juce::roundToInt (37.0f * scale);
@@ -143,9 +133,9 @@ public:
 private:
     static constexpr int kTitleInsetPx = 5;
     static constexpr int kTitleHeightPx = 16;
+    static constexpr float kLabelFontPx = 17.0f;
 
-    // Function-local static: one instance shared by the three faders,
-    // guaranteed to outlive them (same pattern as the dialog helpers).
+    // One shared instance for the three faders; outlives them (static).
     static StretchLookAndFeel& sliderLookAndFeel()
     {
         static StretchLookAndFeel lnf;

@@ -30,16 +30,14 @@ public:
 
         auto area = getLocalBounds().reduced (juce::roundToInt (GUI::Layout::MainMargin()));
 
-        // 300 fits the three fader rows (3 x (18 label + 2 + 42 strip) + gaps
-        // = 214px) inside the card after insets + title strip; anything less
-        // clips the FORMANT row at the card edge. Scales with the UI zoom.
+        // 300 fits the three fader rows in the card; less clips FORMANT.
         const int controlsHeight = m.sc (300.0f);
         const int gap = juce::roundToInt (GUI::Layout::MainGap());
 
         waveform.setBounds (area.removeFromTop (area.getHeight() - controlsHeight - gap));
         area.removeFromTop (gap);
 
-        // Bottom band: sliders card (left) + FX card + transport card (right).
+        // Bottom band: sliders (left) + FX + transport (right).
         const int sideCardWidth = m.sc (190.0f);
         transport.setBounds (area.removeFromRight (sideCardWidth));
         area.removeFromRight (gap);

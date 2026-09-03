@@ -5,8 +5,8 @@
 
 #include <utility>
 
-// System-wide settings store (%APPDATA%\BalamDSP\Stretch), shared by the
-// VST3 and Standalone binaries — defined below, used by the constructor.
+#include "Helpers/StretchSettings.h"
+
 static juce::PropertiesFile& getGlobalSettings();
 
 StretchAudioProcessor::StretchAudioProcessor()
@@ -22,18 +22,20 @@ StretchAudioProcessor::StretchAudioProcessor()
       parameters (*this, nullptr, juce::Identifier ("StretchParams"), createParameterLayout())
 #endif
 {
-    // Seed the export folder from the system-wide setting so every format
-    // and instance starts with the same choice.
+    // Seed shared choices so every format/instance starts alike.
     if (getGlobalSettings().containsKey ("exportFolder"))
         exportFolder = juce::File (getGlobalSettings().getValue ("exportFolder"));
 
-    // Mirror the automatable toggles into their atomics (and apply engage
-    // side-effects) whenever anything moves them.
+    // Mirror automatable toggles into atomics + engage side-effects.
     parameters.addParameterListener ("Freeze", this);
     parameters.addParameterListener ("Rewind", this);
 
     frozen.store (parameters.getRawParameterValue ("Freeze")->load() > 0.5f);
     reversed.store (parameters.getRawParameterValue ("Rewind")->load() > 0.5f);
+
+    // CRT choices are machine-wide (settings.xml), not plugin state.
+    crtEnabled.store (StretchSettings::getCrtEnabled());
+    crtStrength.store (StretchSettings::getCrtStrength());
 }
 
 StretchAudioProcessor::~StretchAudioProcessor()
@@ -41,11 +43,23 @@ StretchAudioProcessor::~StretchAudioProcessor()
     parameters.removeParameterListener ("Freeze", this);
     parameters.removeParameterListener ("Rewind", this);
 
-    // Join the workers before the members they touch (engine, buffers) die.
+    // Join workers before the members they touch die.
     if (fileLoader)
         fileLoader->stopThread (15000);
     if (exportThread)
         exportThread->stopThread (15000);
+}
+
+void StretchAudioProcessor::setCrtEnabled (bool enabled)
+{
+    crtEnabled = enabled;
+    StretchSettings::setCrtEnabled (enabled);
+}
+
+void StretchAudioProcessor::setCrtStrength (int strength)
+{
+    crtStrength.store (juce::jlimit (0, 2, strength));
+    StretchSettings::setCrtStrength (strength);
 }
 
 void StretchAudioProcessor::parameterChanged (const juce::String& parameterID, float newValue)
@@ -89,7 +103,7 @@ void StretchAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     engine.reset();
     glideRate = parameters.getRawParameterValue ("TimeRatio")->load();
 
-    // Worst-case source consumption: RATE 400 % consumes 4x per output block.
+    // Worst-case consumption: 400% eats 4x per output block.
     const int worstInput = StretchEngine::inputSamplesForOutput (samplesPerBlock, 4.0f);
     const int scratchSize = juce::jmax (4096, worstInput + 16);
 
@@ -135,7 +149,7 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     for (int i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, numSamples);
 
-    // Nothing loaded -> pass the host/device audio through untouched.
+    // Nothing loaded: pass host/device audio through.
     if (! engine.hasSource())
         return;
 
@@ -151,18 +165,16 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     engine.updateStretcherParams (pitchSemi, formantPreserve, formantSemi);
 
     const bool loop = looping.load();
-    const bool frozen = this->frozen.load();
+    const bool frozenState = frozen.load();
 
-    // REWIND latches reverse playback: flip the RATE sign at full rate.
+    // REWIND flips the RATE sign for reverse playback.
     const float dirRate = reversed.load() ? -timeRatio : timeRatio;
 
-    // FROZEN: effective rate 0 -- zero input consumed so the stretcher holds
-    // its grains (stillness), identical to parking RATE at 0 %. The playhead
-    // stays put; no seeks are issued in this mode.
-    const float effRate = frozen ? 0.0f : dirRate;
+    // FROZEN = rate 0: no input consumed, playhead parked, no seeks.
+    const float effRate = frozenState ? 0.0f : dirRate;
     const bool backward = dirRate < 0.0f;
 
-    // Scrub requests land here (also handles seek-while-stopped on resume).
+    // Pending seeks (scrub / seek-while-stopped).
     const int64_t seekTarget = pendingSeek.exchange (-1);
     if (seekTarget >= 0)
     {
@@ -185,25 +197,20 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
     const int numOutChannels = juce::jmin (totalNumOutputChannels, engine.getChannels());
 
-    // Freeze de-click: instead of stepping the effective rate (which makes
-    // the stretcher's input consumption jump and clicks at the grain
-    // boundary), GLIDE it toward the target with a ~5 ms time constant --
-    // fully settled well inside 20 ms. Engaging FREEZE tapers consumption
-    // to zero; disengaging ramps back up. A REWIND flip glides through
-    // zero just as smoothly. Audio-thread only state under processingMutex.
+    // Freeze glide: ease the rate (~5ms tau) so input consumption never
+    // steps at grain boundaries. Rewind flips glide through zero too.
     {
         const double sr = engine.getSampleRate() > 0.0 ? engine.getSampleRate() : 48000.0;
         const double tau = juce::jmax (1.0, 0.005 * sr);
         const double coeff = 1.0 - std::exp (- (double) numSamples / tau);
         glideRate += ((double) effRate - glideRate) * coeff;
 
-        // Snap once indistinguishably close so the tail does not linger.
+        // Snap when close so the tail doesn't linger.
         if (std::abs (glideRate - (double) effRate) < 1e-4 * juce::jmax (1.0f, std::abs (effRate)))
             glideRate = effRate;
     }
 
-    // Loop region (fractions of the source). Degenerate selections fall
-    // back to the full file; the region only shapes LOOPED playback.
+    // Loop region as samples; degenerate selections use the full file.
     const int64_t len64 = (int64_t) len;
     int64_t regionA = 0;
     int64_t regionB = len64;
@@ -222,7 +229,7 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
     int64_t pos = playPosition.load();
 
-    // Clamp a stray playhead back into the active region before filling.
+    // Clamp stray playheads back into the region before filling.
     if (loop && (pos < regionA || pos >= regionB))
     {
         int64_t rel = (pos - regionA) % regionSpan;
@@ -235,10 +242,8 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
                                   scratchInput.getNumSamples());
     const int sourceChannels = engine.getSourceChannels();
 
-    // Fill the contiguous scratch window in READ ORDER (decreasing indices
-    // when playing backward), loop-wrapping or zero-padding past either end.
-    // iWrapIn records where the read crossed the region edge (input domain),
-    // so the output-side seam can be faded below.
+    // Fill scratch in read order (backward when reversed), wrapping or
+    // zero-padding past the ends. iWrapIn marks the seam for the fade below.
     bool reachedEnd = false;
     int iWrapIn = -1;
     for (int c = 0; c < engine.getChannels(); ++c)
@@ -278,11 +283,8 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     engine.renderBlock (scratchInPtrs.data(), engine.getChannels(), numIn,
                         outPtrs.data(), numOutChannels, numSamples);
 
-    // Reverse loop-seam de-click: the wrap forces engine.reset() below,
-    // discarding the stretcher's grain state -- a hard reset clicks. Mask
-    // it with a short equal-power dip centred where the seam lands in the
-    // rendered block (input index mapped through the glide rate; exact
-    // stretcher latency alignment is unnecessary for a masking fade).
+    // Loop-seam de-click: the wrap resets the stretcher (clicks), so mask
+    // it with a short equal-power dip at the seam.
     if (iWrapIn >= 0 && numSamples > 0)
     {
         const double sr = engine.getSampleRate() > 0.0 ? engine.getSampleRate() : 48000.0;
@@ -307,11 +309,11 @@ void StretchAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
             applyDip (c);
     }
 
-    if (outputGain != 1.0f)
+    if (std::abs (outputGain - 1.0f) > 1.0e-5f)
         for (int c = 0; c < numOutChannels; ++c)
             buffer.applyGain (c, 0, numSamples, outputGain);
 
-    if (! frozen)
+    if (! frozenState)
     {
         pos += backward ? -(int64_t) numIn : (int64_t) numIn;
 
@@ -346,9 +348,11 @@ void StretchAudioProcessor::transportPlay()
     if (! playing.load())
     {
         const double frac = transportFraction.load();
-        const bool backward = parameters.getRawParameterValue ("TimeRatio")->load() < 0.0f;
+        // Rewind flips RATE sign; restart mirrors playback direction.
+        const float time = parameters.getRawParameterValue ("TimeRatio")->load();
+        const bool backward = (reversed.load() ? -time : time) < 0.0f;
 
-        // Restart from the "end" of the current direction at end-of-file.
+        // Restart at the directional "end" when at end-of-file.
         const bool atEnd = backward ? (frac <= 0.001) : (frac >= 0.999);
         if (! looping.load() && atEnd)
             pendingSeek.store (backward ? engine.getSourceLength() : 0);
@@ -384,18 +388,14 @@ void StretchAudioProcessor::seekToFraction (double fraction)
     transportFraction.store (fraction);
 }
 
-// UI / keyboard entry points notify the host through the parameter; the
-// parameterChanged listener then mirrors the value into the audio-side
-// atomic and applies engage side-effects exactly once.
+// UI/keyboard drive the params; the listener mirrors into audio atomics.
 void StretchAudioProcessor::setFrozen (bool b)
 {
     auto* param = parameters.getParameter ("Freeze");
     if (param == nullptr)
         return;
 
-    // Audio truth moves immediately: a matching value short-circuits the
-    // host notification (no redundant automation points), so the listener
-    // would not fire and the atomic must be synced here.
+    // Sync here too: a matching value skips host notify, so no listener fires.
     frozen.store (b);
     if ((param->getValue() > 0.5f) == b)
         return;
@@ -420,10 +420,7 @@ void StretchAudioProcessor::setReversed (bool b)
     param->endChangeGesture();
 }
 
-// Decoding runs on a worker so drag-drop, recent-file and session-recall
-// loads never stall the message thread (ROADMAP §3 "project recall" requires
-// the async path). The newest request wins: starting a new load joins the
-// previous worker first, discarding its partial result.
+// Async load; newest request wins (old worker joins first).
 void StretchAudioProcessor::loadAudioFile (const juce::File& file)
 {
     if (! file.existsAsFile())
@@ -432,14 +429,19 @@ void StretchAudioProcessor::loadAudioFile (const juce::File& file)
     if (fileLoader)
         fileLoader->stopThread (15000);
 
-    // Remember the path immediately: a host saving state right after a
-    // restore must still see the SourcePath it just handed us. Cleared
-    // again by the worker if the decode fails.
+    // Remember now so a host saving state right after still sees the path;
+    // cleared again if the decode fails.
     sourceFile = file;
     recordRecentFile (file);
 
     fileLoader = std::make_unique<FileLoadThread> (*this, file);
     fileLoader->startThread();
+}
+
+void StretchAudioProcessor::loadAudioFilePreservingView (const juce::File& file)
+{
+    pendingViewStateRestore.store (true); // keep restored view on the reload
+    loadAudioFile (file);
 }
 
 void StretchAudioProcessor::FileLoadThread::run()
@@ -452,6 +454,32 @@ void StretchAudioProcessor::FileLoadThread::run()
     if (reader == nullptr || threadShouldExit())
     {
         owner.sourceFile = juce::File(); // don't persist an unloadable path
+        if (reader == nullptr)
+        {
+            DBG ("Stretch: no decoder for " << file.getFullPathName());
+            auto callback = owner.onFileLoadFailed;
+            const juce::String path = file.getFullPathName();
+            juce::MessageManager::callAsync ([callback, path]
+            {
+                if (callback)
+                    callback ("No decoder for:\n" + path
+                              + "\n\nUnsupported or corrupt file.");
+            });
+        }
+        return;
+    }
+
+    if (reader->lengthInSamples <= 0 || reader->numChannels <= 0)
+    {
+        DBG ("Stretch: empty stream for " << file.getFullPathName());
+        owner.sourceFile = juce::File();
+        auto callback = owner.onFileLoadFailed;
+        const juce::String path = file.getFullPathName();
+        juce::MessageManager::callAsync ([callback, path]
+        {
+            if (callback)
+                callback ("No audio in:\n" + path);
+        });
         return;
     }
 
@@ -461,7 +489,10 @@ void StretchAudioProcessor::FileLoadThread::run()
     reader->read (&decoded, 0, (int) reader->lengthInSamples, 0, true, true);
 
     if (threadShouldExit())
+    {
+        DBG ("Stretch: load superseded for " << file.getFullPathName());
         return;
+    }
 
     owner.installLoadedFile (std::move (decoded), rate, file);
 }
@@ -492,11 +523,12 @@ void StretchAudioProcessor::installLoadedFile (juce::AudioBuffer<float>&& decode
     pendingSeek.store (0);
     transportFraction.store (0.0);
     playing.store (true); // start playback immediately on load
+    DBG ("Stretch: loaded " << originalBuffer.getNumSamples()
+         << " samples @ " << fileSampleRate << " Hz");
 
     if (onFileLoaded)
     {
-        // Copy the delegate before queueing: the editor may swap or clear it
-        // while this lambda sits in the message queue.
+        // Copy: the editor may swap/clear it while queued.
         auto callback = onFileLoaded;
         juce::MessageManager::callAsync ([callback] { callback(); });
     }
@@ -513,8 +545,7 @@ void StretchAudioProcessor::unloadSample()
     sourceFile = juce::File();
 }
 
-// Recorded at request time on the message thread (PropertiesFile is not
-// thread-safe); a failed decode leaves a stale entry.
+// Recorded on the message thread (PropertiesFile isn't thread-safe).
 void StretchAudioProcessor::recordRecentFile (const juce::File& file)
 {
     auto& settings = getGlobalSettings();
@@ -549,12 +580,10 @@ void StretchAudioProcessor::clearRecentFiles()
     settings.saveIfNeeded();
 }
 
-// Hard cap (seconds of output audio) for freeze / near-zero-rate renders.
+// Frozen/near-zero rates cap at two minutes of output.
 static constexpr double kExportCapSeconds = 120.0;
 
-// User-level settings shared by the VST3 and Standalone binaries. Lives at
-// %APPDATA%\BalamDSP\Stretch\Stretch.settings — same path no matter which
-// format (or host) loads us, so a folder set anywhere is remembered everywhere.
+// System-wide settings (%APPDATA%\BalamDSP\Stretch), shared by all formats.
 static juce::PropertiesFile& getGlobalSettings()
 {
     juce::PropertiesFile::Options opts;
@@ -591,7 +620,7 @@ StretchAudioProcessor::ExportOptions StretchAudioProcessor::getExportOptions()
     opts.format     = (ExportFormat) juce::jlimit (0, 2,
                         settings.getIntValue ("exportFormat", 0));
 
-    // Sanitize: only WAV stores IEEE float; anything else clamps to 24.
+    // 32F is WAV-only; other formats clamp to 24.
     if (opts.bitDepth != 16 && opts.bitDepth != 24 && opts.bitDepth != 32)
         opts.bitDepth = 16;
     if (opts.bitDepth == 32 && opts.format != ExportFormat::wav)
@@ -609,18 +638,46 @@ void StretchAudioProcessor::setExportOptions (const ExportOptions& opts)
     settings.saveIfNeeded();
 }
 
+bool StretchAudioProcessor::hasActiveSelection() const noexcept
+{
+    const double s = loopStart.load();
+    const double e = loopEnd.load();
+    return e > s + 1e-6 && (s > 0.0 || e < 1.0);
+}
+
+void StretchAudioProcessor::getExportRange (int totalSamples, int& startOut, int& lengthOut) const noexcept
+{
+    startOut = 0;
+    lengthOut = totalSamples;
+
+    if (totalSamples <= 0 || ! hasActiveSelection())
+        return;
+
+    const int start = (int) (juce::jlimit (0.0, 1.0, loopStart.load()) * (double) totalSamples);
+    const int end = (int) std::ceil (juce::jlimit (0.0, 1.0, loopEnd.load()) * (double) totalSamples);
+
+    const int s = juce::jlimit (0, totalSamples - 1, start);
+    const int e = juce::jlimit (s + 1, totalSamples, end);
+
+    if (e > s)
+    {
+        startOut = s;
+        lengthOut = e - s;
+    }
+}
+
 juce::int64 StretchAudioProcessor::estimateExportBytes() const
 {
     if (! hasLoadedFile())
         return 0;
 
-    // Same length math as StretchEngine::processOffline, adjusted for the
-    // global export options: a fixed sample rate rescales the output
-    // length and the bit depth sets the per-sample storage size.
+    int start = 0, length = originalBuffer.getNumSamples();
+    getExportRange (originalBuffer.getNumSamples(), start, length);
+
     const double safeRate = juce::jlimit (0.05, 20.0,
         (double) std::abs (parameters.getRawParameterValue ("TimeRatio")->load()));
 
-    double outputSamples = (double) originalBuffer.getNumSamples() / safeRate;
+    double outputSamples = (double) length / safeRate;
 
     const ExportOptions opts = getExportOptions();
     if (opts.sampleRate > 0 && fileSampleRate > 0.0)
@@ -640,25 +697,33 @@ bool StretchAudioProcessor::startBackgroundExport()
         return false;
 
     if (exportThread)
-        exportThread->stopThread (15000); // join a finished/stale worker
+        exportThread->stopThread (15000); // join stale worker
 
-    // Private copy of the source, taken under the mutex: a session recall
-    // may swap originalBuffer on the loader thread while this renders. The
-    // reversal for backward exports happens in-place on the copy.
+    // Private copy under the mutex; backward reversal happens on the copy.
     juce::AudioBuffer<float> snapshot;
     double srcRate = 0.0;
+    int selStart = 0, selLen = 0;
 
     {
         std::lock_guard<std::mutex> lock (processingMutex);
         snapshot = originalBuffer;
         srcRate = fileSampleRate;
+        getExportRange (snapshot.getNumSamples(), selStart, selLen);
+    }
+
+    // Render the selection slice when one exists.
+    if (selLen > 0 && selLen < snapshot.getNumSamples())
+    {
+        juce::AudioBuffer<float> sliced (snapshot.getNumChannels(), selLen);
+        for (int c = 0; c < snapshot.getNumChannels(); ++c)
+            sliced.copyFrom (c, 0, snapshot, c, selStart, selLen);
+        snapshot = std::move (sliced);
     }
 
     exportCancelFlag.store (false);
     exportProgress.store (0.0);
 
-    // Snapshot the global options on THIS (message) thread: PropertiesFile
-    // is not thread-safe and the worker must not touch it later.
+    // Snapshot options here: PropertiesFile isn't thread-safe.
     const ExportOptions opts = getExportOptions();
 
     exportThread = std::make_unique<ExportThread> (*this, std::move (snapshot), srcRate, opts);
@@ -673,11 +738,12 @@ bool StretchAudioProcessor::isExportRunning() const noexcept
 
 void StretchAudioProcessor::ExportThread::run()
 {
-    // Parameter snapshot: raw parameter slots are stable atomics (the
-    // processor joins this thread before its members die).
+    // Raw param slots are stable atomics (joined before members die).
     const float pitch = owner.parameters.getRawParameterValue ("PitchSemitones")->load();
     const float time = owner.parameters.getRawParameterValue ("TimeRatio")->load();
-    const float rateMag = std::abs (time);
+    // Rewind flips RATE sign; export mirrors playback.
+    const float dirRate = owner.isReversed() ? -time : time;
+    const float rateMag = std::abs (dirRate);
     const bool formantPreserve = owner.parameters.getRawParameterValue ("FormantPreserve")->load() > 0.5f;
     const float formantSemi = owner.parameters.getRawParameterValue ("FormantSemitones")->load();
 
@@ -687,21 +753,19 @@ void StretchAudioProcessor::ExportThread::run()
 
         if (owner.onExportFinished)
         {
-            auto callback = owner.onExportFinished; // copy: editor may swap it
+            auto callback = owner.onExportFinished; // editor may swap it
             juce::MessageManager::callAsync ([callback, ok, f, cancelled]
                 { callback (ok, f, cancelled); });
         }
     };
 
-    // Mitigation for endless renders: frozen or near-zero rates cap at two
-    // minutes of output.
+    // Frozen/near-zero rates cap at two minutes.
     const int maxOutputSamples = (owner.isFrozen() || rateMag < 0.10f)
         ? (int) ((double) fileSampleRate * kExportCapSeconds)
         : 0;
 
-    // Backward export: the stretcher only runs forward, so reverse the
-    // snapshot in place and render at the magnitude.
-    if (time < 0.0f)
+    // Backward: stretcher runs forward only, so reverse and use magnitude.
+    if (dirRate < 0.0f)
     {
         const int numCh = source.getNumChannels();
         const int numSamples = source.getNumSamples();
@@ -730,8 +794,7 @@ void StretchAudioProcessor::ExportThread::run()
     if (rendered.getNumSamples() <= 0)
         { finish (false, {}, false); return; }
 
-    // Optional fixed-rate export: resample the render (message-thread-free
-    // worker context; the helper is a pure static).
+    // Fixed-rate export: resample the render (worker context, pure static).
     const int targetRate = options.sampleRate;
     if (targetRate > 0 && fileSampleRate > 0.0
         && std::abs (fileSampleRate - (double) targetRate) >= 1.0)
@@ -747,7 +810,6 @@ void StretchAudioProcessor::ExportThread::run()
 
     const double outRate = (targetRate > 0) ? (double) targetRate : fileSampleRate;
 
-    // Format selection; the bit depth is finalized at writer creation.
     const char* extension = ".wav";
     std::unique_ptr<juce::AudioFormat> format;
 
@@ -780,10 +842,7 @@ void StretchAudioProcessor::ExportThread::run()
     if (stream == nullptr)
         { finish (false, {}, false); return; }
 
-    // Options-based writer API (the legacy overload is deprecated and
-    // returns a raw pointer). 32-bit WAV selects IEEE float storage;
-    // AIFF/FLAC clamp to 24-bit integer (getExportOptions already does,
-    // re-checked defensively here).
+    // 32-bit WAV = IEEE float; AIFF/FLAC clamp to 24 (re-checked here).
     int bits = options.bitDepth;
     if (options.format != ExportFormat::wav && bits == 32)
         bits = 24;
@@ -803,7 +862,7 @@ void StretchAudioProcessor::ExportThread::run()
     if (writer == nullptr)
         { finish (false, {}, false); return; }
 
-    stream.release(); // AudioFormatWriter takes ownership of the stream
+    stream.release(); // writer owns the stream now
 
     writer->writeFromAudioSampleBuffer (rendered, 0, rendered.getNumSamples());
     writer.reset();
@@ -811,7 +870,7 @@ void StretchAudioProcessor::ExportThread::run()
     finish (true, out, false);
 }
 
-// Semitone readout: always one decimal, e.g. "-12.0 st", "7.5 st".
+// One decimal, e.g. "-12.0 st".
 static juce::String semitonesText (float v)
 {
     return juce::String (v, 1) + " st";
@@ -833,10 +892,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout StretchAudioProcessor::creat
             .withValueFromStringFunction ([] (const juce::String& s)
                 { return s.retainCharacters ("-+.0123456789").getFloatValue(); })));
 
-    // RATE: -400 % .. +400 %. Negative = backward playback (the source is
-    // fed to the stretcher in reverse). Travel mapping mirrors the old
-    // "100 % mid-travel" skew around zero: 0 % dead-centre, +-100 % at the
-    // quarter points, +-400 % at the ends.
+    // RATE -400..+400%; negative = backward. 0% centre, +-100% quarter points.
     juce::NormalisableRange<float> rateRange (-4.0f, 4.0f, 0.01f, 0.5f, true);
 
     using RateAttributes = juce::AudioParameterFloatAttributes;
@@ -868,17 +924,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout StretchAudioProcessor::creat
         juce::NormalisableRange<float> (-60.0f, 12.0f, 0.1f, 1.0f),
         0.0f));
 
-    // FREEZE / REWIND as automatable booleans. The FX-card toggles and the
-    // keyboard shortcuts both drive the processor through these; the audio
-    // thread only ever sees the mirrored atomics.
+    // FREEZE/REWIND: automatable; UI + shortcuts drive the params, audio
+    // reads the mirrored atomics.
     params.push_back (std::make_unique<juce::AudioParameterBool>(
         "Freeze", "Freeze", false));
 
     params.push_back (std::make_unique<juce::AudioParameterBool>(
         "Rewind", "Rewind", false));
 
-    // UI zoom: persisted choice (100%..300%). The editor follows it via an
-    // APVTS listener and resizes everything proportionally (see Metrics).
+    // UI zoom: persisted choice; the editor resizes off it.
     juce::StringArray zoomChoices;
     for (const auto p : StretchZoom::ZOOM_PERCENTS)
         zoomChoices.add (juce::String ((int) p) + "%");
@@ -897,27 +951,25 @@ void StretchAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     tree.setProperty ("Formant", parameters.getRawParameterValue ("FormantPreserve")->load(), nullptr);
     tree.setProperty ("FormantShift", parameters.getRawParameterValue ("FormantSemitones")->load(), nullptr);
     tree.setProperty ("Gain", parameters.getRawParameterValue ("OutputGain")->load(), nullptr);
-    tree.setProperty ("CrtEnabled", crtEnabled.load(), nullptr);
 
-    // Toggles ride in plugin state so a session reload restores them; hosts
-    // that automate them will overwrite via the parameters anyway.
+    // Toggles ride in state for session reload (automation overwrites).
     tree.setProperty ("Frozen", frozen.load(), nullptr);
     tree.setProperty ("Rewinded", reversed.load(), nullptr);
 
-    // Project recall: remember which audio file backs this session so the
-    // host can hand it back on restore (audio content itself is far too
-    // large to live in plugin state).
+    // Project recall: source path only (audio is too large for state).
     tree.setProperty ("SourcePath", sourceFile.getFullPathName(), nullptr);
 
-    // Waveform view + loop region: so editor open/close and presets
-    // preserve scroll, zoom and selection.
+    // CRT overlay: file may be unwritable (sandboxed AU), so state carries it.
+    tree.setProperty ("CrtEnabled", crtEnabled.load(), nullptr);
+    tree.setProperty ("CrtStrength", crtStrength.load(), nullptr);
+
+    // View + selection persist across editor open/close and presets.
     tree.setProperty ("WaveViewStart", waveViewStart.load(), nullptr);
     tree.setProperty ("WaveViewLen",  waveViewLen.load(), nullptr);
     tree.setProperty ("LoopStart",   loopStart.load(), nullptr);
     tree.setProperty ("LoopEnd",     loopEnd.load(), nullptr);
 
-    // NOTE: the export folder is deliberately NOT saved here — it lives in
-    // the system-wide settings file so all formats/instances share one value.
+    // Export folder NOT saved here: system-wide, shared by all instances.
     juce::MemoryOutputStream stream;
     tree.writeToStream (stream);
     destData.setSize (stream.getDataSize());
@@ -926,7 +978,7 @@ void StretchAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 
 void StretchAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    juce::MemoryInputStream stream (data, sizeInBytes, false);
+    juce::MemoryInputStream stream (data, (size_t) sizeInBytes, false);
     juce::ValueTree tree = juce::ValueTree::readFromStream (stream);
 
     if (tree.isValid())
@@ -950,15 +1002,19 @@ void StretchAudioProcessor::setStateInformation (const void* data, int sizeInByt
             parameters.getParameter ("OutputGain")->setValueNotifyingHost (
                 parameters.getParameter ("OutputGain")->convertTo0to1 (
                     (float) tree.getProperty ("Gain", 0.0f)));
-        if (tree.hasProperty ("CrtEnabled"))
-            crtEnabled.store ((bool) tree.getProperty ("CrtEnabled", true));
 
         if (tree.hasProperty ("Frozen"))
             setFrozen ((bool) tree.getProperty ("Frozen", false));
         if (tree.hasProperty ("Rewinded"))
             setReversed ((bool) tree.getProperty ("Rewinded", false));
 
-        // Waveform view + loop region. The editor re-syncs from these below.
+        // CRT overlay (also re-persisted to file best-effort by the setters).
+        if (tree.hasProperty ("CrtStrength"))
+            setCrtStrength ((int) tree.getProperty ("CrtStrength", 2));
+        if (tree.hasProperty ("CrtEnabled"))
+            setCrtEnabled ((bool) tree.getProperty ("CrtEnabled", true));
+
+        // View + selection; the editor re-syncs from these.
         if (tree.hasProperty ("WaveViewStart"))
             setWaveViewStart ((double) tree.getProperty ("WaveViewStart", 0.0));
         if (tree.hasProperty ("WaveViewLen"))
@@ -967,9 +1023,7 @@ void StretchAudioProcessor::setStateInformation (const void* data, int sizeInByt
             setLoopRegion ((double) tree.getProperty ("LoopStart", 0.0),
                            (double) tree.getProperty ("LoopEnd", 1.0));
 
-        // Project recall: re-request the referenced source through the
-        // async load path. Missing files are skipped silently; a state
-        // without a usable path leaves this instance empty.
+        // Project recall via the async load path; missing files skip silently.
         const auto sourcePath = tree.getProperty ("SourcePath").toString();
         const juce::File file (sourcePath);
 
@@ -977,7 +1031,7 @@ void StretchAudioProcessor::setStateInformation (const void* data, int sizeInByt
         {
             if (! (hasLoadedFile() && file == sourceFile))
             {
-                pendingViewStateRestore = true;  // keep restored view on the reload
+                pendingViewStateRestore = true; // keep restored view on reload
                 loadAudioFile (file);
             }
             else
@@ -990,7 +1044,7 @@ void StretchAudioProcessor::setStateInformation (const void* data, int sizeInByt
         }
         else if (hasLoadedFile())
         {
-            unloadSample(); // exact restore: no path -> nothing loaded
+            unloadSample(); // no path -> nothing loaded
         }
     }
 }

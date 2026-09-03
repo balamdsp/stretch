@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "Core/StretchEngine.h"
+#include "Helpers/StretchPresets.h"
 
 // Persistent UI zoom. Choice parameter, 100% floor.
 namespace StretchZoom
@@ -23,6 +24,8 @@ class StretchAudioProcessor : public juce::AudioProcessor,
                               private juce::AudioProcessorValueTreeState::Listener
 {
 public:
+    using juce::AudioProcessor::processBlock;
+
     StretchAudioProcessor();
     ~StretchAudioProcessor() override;
 
@@ -56,21 +59,22 @@ public:
 
     juce::AudioProcessorValueTreeState parameters;
 
-    // Decodes on a worker thread (never blocks the message thread); the
-    // newest request wins. Completion fires onFileLoaded on the message
-    // thread. Used by drag-drop, recent files and session recall alike.
+    // Papalote-style preset session (Init/Save/Save-As tracking).
+    StretchPresets::Session presetSession;
+
+    // Async decode; newest request wins, completion on the message thread.
     void loadAudioFile (const juce::File& file);
+    // Same, but keeps the current view/selection across the reload.
+    void loadAudioFilePreservingView (const juce::File& file);
     void unloadSample();
     bool hasLoadedFile() const noexcept { return originalBuffer.getNumSamples() > 0; }
     const juce::AudioBuffer<float>& getOriginalBuffer() const { return originalBuffer; }
     double getFileSampleRate() const { return fileSampleRate; }
 
-    // File the current/last load came from; persisted in plugin state so a
-    // host session restore can re-request it (project recall).
+    // Current source file; persisted in state for session recall.
     const juce::File& getSourceFile() const noexcept { return sourceFile; }
 
-    // Global list (%APPDATA%\BalamDSP\Stretch) shared by every format and
-    // instance, like the export folder. Move-to-front, capped.
+    // Global recent list (%APPDATA%\BalamDSP\Stretch); move-to-front, capped.
     static constexpr int kMaxRecentFiles = 10;
     void recordRecentFile (const juce::File& file);
     juce::StringArray getRecentFiles() const;
@@ -85,14 +89,15 @@ public:
     void seekToFraction (double fraction);
     double getTransportFraction() const noexcept { return transportFraction.load(); }
 
-    // Fractions of the source (0..1). Full range when no selection exists,
-    // so the transport wraps the whole file exactly as before. The waveform
-    // selection is the single writer; processBlock reads both atomics.
+    // Loop-region fractions (0..1); full range when no selection exists.
     void setLoopRegion (double start, double end) noexcept
     {
         loopStart.store (juce::jlimit (0.0, 1.0, start));
         loopEnd.store (juce::jlimit (0.0, 1.0, end));
     }
+    // (0,1) means none; export renders the slice when active.
+    bool hasActiveSelection() const noexcept;
+    void getExportRange (int totalSamples, int& startOut, int& lengthOut) const noexcept;
     double getLoopStart() const noexcept { return loopStart.load(); }
     double getLoopEnd() const noexcept { return loopEnd.load(); }
 
@@ -103,7 +108,7 @@ public:
 
     std::function<void()> onViewStateRestored;
 
-    // Current RATE parameter as a raw multiplier (1.0 = 100 %).
+    // RATE as a raw multiplier (1.0 = 100 %).
     float getRateValue() const
     {
         return parameters.getRawParameterValue ("TimeRatio")->load();
@@ -111,35 +116,31 @@ public:
 
     juce::File getExportFolder() const { return exportFolder; }
 
-    // Persists system-wide (%APPDATA%\BalamDSP\Stretch) so every format and
-    // instance remembers it until reset or replaced.
+    // System-wide folder shared by every format/instance.
     void setExportFolder (const juce::File& folder);
 
     bool hasExportFolder() const { return exportFolder.isDirectory(); }
 
-    // Starts rendering the CURRENT settings offline on a worker thread to a
-    // timestamped WAV in the export folder (or temp when unset). Returns
-    // false when nothing is loaded or an export is already running.
+    // Offline render of current settings to a timestamped file (export
+    // folder, else temp). False when empty or already running.
     bool startBackgroundExport();
 
     bool isExportRunning() const noexcept;
 
-    // Render progress 0..1 (valid while an export runs).
+    // Render progress 0..1.
     double getExportProgress() const noexcept { return exportProgress.load(); }
 
-    // Asks the running export to stop at the next chunk boundary (~100 ms).
+    // Stop at the next chunk boundary.
     void cancelExport() noexcept { exportCancelFlag.store (true); }
 
-    // Completion fires ON THE MESSAGE THREAD: success=false means failure
-    // (or cancel, see flag), outFile is empty unless success=true.
+    // Fires on the message thread; outFile empty unless success.
     std::function<void (bool success, juce::File outFile, bool cancelled)> onExportFinished;
 
-    // Exports above this size raise a warning before rendering.
+    // Above this size, warn before rendering.
     static constexpr juce::int64 kMaxExportBytes = 100 * 1024 * 1024;
 
-    // Global (system-wide) choices shared by every format/instance, applied
-    // by the background render: WAV / AIFF / FLAC, 16 / 24 / 32-float bits
-    // (32F is WAV-only; non-WAV formats clamp to 24), source or fixed rate.
+    // System-wide choices for the background render. 32F is WAV-only;
+    // other formats clamp to 24. Rate 0 = source rate.
     enum class ExportFormat { wav = 0, aiff = 1, flac = 2 };
 
     struct ExportOptions
@@ -158,48 +159,45 @@ public:
         return bitDepth >= 32 ? 4 : (bitDepth >= 24 ? 3 : 2);
     }
 
-    // Rough WAV/AIFF/FLAC size (bytes) an export would produce right now
-    // with the current global export options; 0 when no source is loaded.
+    // Rough export size in bytes with current options; 0 when empty.
     juce::int64 estimateExportBytes() const;
 
     bool isCrtEnabled() const noexcept { return crtEnabled.load(); }
-    void setCrtEnabled (bool b) noexcept { crtEnabled = b; }
+    void setCrtEnabled (bool b);
     const std::atomic<bool>& getCrtEnabledFlag() const noexcept { return crtEnabled; }
 
-    // Runtime wrapper check. Plugin sources compile once into the shared
-    // code lib, so JUCE_STANDALONE_APPLICATION is 1 for ALL formats here —
-    // only wrapperType knows how this instance was actually loaded.
+    // CRT strength 0/1/2 = Low/Med/High; machine-wide via settings.xml.
+    int getCrtStrength() const noexcept { return crtStrength.load(); }
+    void setCrtStrength (int strength);
+
+    // JUCE_STANDALONE_APPLICATION is 1 for all formats here (shared lib);
+    // only wrapperType tells how this instance was loaded.
     bool isRunningAsStandalone() const noexcept
     {
         return wrapperType == juce::AudioProcessor::wrapperType_Standalone;
     }
 
-    // Tape-style freeze: holds the source window under the stretcher so the
-    // current texture sustains indefinitely. Automatable: backed by the
-    // "Freeze" APVTS parameter; the atomic is the audio-thread's copy.
+    // Freeze: rate 0 holds the stretcher grains (sustains the texture).
+    // Backed by the "Freeze" param; the atomic is the audio-thread copy.
     bool isFrozen() const noexcept { return frozen.load(); }
     void setFrozen (bool b);
 
-    // REWIND button: latching reverse playback -- inverts the RATE sign so
-    // the material plays backwards at the same rate. Automatable via the
-    // "Rewind" APVTS parameter.
+    // Rewind: latching reverse; flips the RATE sign at the same rate.
     bool isReversed() const noexcept { return reversed.load(); }
     void setReversed (bool b);
 
     std::function<void()> onFileLoaded;
 
+    // Fires on the message thread when a decode fails, with a reason.
+    std::function<void (const juce::String& reason)> onFileLoadFailed;
+
 private:
-    // APVTS listener: mirrors the Freeze/Rewind parameters into the audio
-    // thread's atomics and applies the engage side-effects once, no matter
-    // who moved the value (host automation, UI toggle, keyboard shortcut).
+    // Mirrors Freeze/Rewind params into audio atomics + engage side-effects.
     void parameterChanged (const juce::String& parameterID, float newValue) override;
 
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
-    // Decodes an audio file on this worker thread and installs it into the
-    // processor (see loadAudioFile). One live instance at a time: replacing
-    // the unique_ptr joins the old worker first, which discards any partial
-    // result and makes the newest request authoritative.
+    // Decode worker; newest request wins (old worker joins first).
     class FileLoadThread : public juce::Thread
     {
     public:
@@ -213,16 +211,12 @@ private:
         const juce::File file;
     };
 
-    // Worker-side completion of a decode: swaps buffers under the mutex,
-    // restarts transport and posts onFileLoaded to the message thread.
+    // Swaps decoded buffers under the mutex, posts onFileLoaded.
     void installLoadedFile (juce::AudioBuffer<float>&& decoded,
                             double sampleRate, const juce::File& file);
 
-    // Renders a private snapshot of the source offline and writes the WAV/
-    // AIFF/FLAC file. The snapshot decouples the render from live state: the
-    // loader thread may swap originalBuffer mid-export without tearing it.
-    // Progress is published to exportProgress; exportCancelFlag stops it
-    // chunk-wise. Options are snapshotted on the message thread at start.
+    // Offline render on a private source snapshot (loader can't tear it).
+    // Options snapshot on the message thread; progress/cancel chunk-wise.
     class ExportThread : public juce::Thread
     {
     public:
@@ -248,6 +242,7 @@ private:
     juce::File exportFolder;
 
     std::atomic<bool> crtEnabled { true };
+    std::atomic<int>  crtStrength { 2 };
     std::atomic<bool> frozen { false };
     std::atomic<bool> reversed { false };
     std::mutex processingMutex;                // guards source swaps vs audio thread
@@ -262,13 +257,11 @@ private:
     std::atomic<int64_t> pendingSeek { -1 };
     std::atomic<double> transportFraction { 0.0 };
 
-    // Freeze de-click: the effective rate GLIDES toward its target over
-    // ~20 ms whenever FREEZE engages/disengages, so the stretcher's input
-    // consumption tapers smoothly instead of stepping (grain-boundary click).
-    // Audio-thread only, guarded by processingMutex.
+    // Freeze glide: effective rate eases over ~20ms to avoid grain clicks.
+    // Audio-thread only, under processingMutex.
     double glideRate = 1.0;
 
-    // Audio-thread scratch (sized for worst-case input consumption at ratio 0.25).
+    // Scratch sized for worst-case consumption at ratio 0.25.
     juce::AudioBuffer<float> scratchInput;
     std::vector<float*> scratchInPtrs;
     std::vector<const float*> srcPtrs;
@@ -279,13 +272,10 @@ private:
     std::atomic<double> exportProgress { 0.0 };
     std::atomic<bool> exportCancelFlag { false };
 
-    // Written by setStateInformation (message thread) before a file reload,
-    // read once by installLoadedFile (worker thread) to decide whether to
-    // reset the view state.
+    // Set by setStateInformation before reload; consumed by installLoadedFile.
     std::atomic<bool> pendingViewStateRestore { false };
 
-    // Declared LAST so they are destroyed FIRST (before engine/buffers they
-    // touch); the destructor also joins them explicitly.
+    // Declared LAST: destroyed FIRST (destructor also joins them).
     std::unique_ptr<FileLoadThread> fileLoader;
     std::unique_ptr<ExportThread> exportThread;
 

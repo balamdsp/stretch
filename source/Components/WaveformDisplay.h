@@ -7,19 +7,8 @@
 #include "../PluginProcessor.h"
 #include "StretchTransportCard.h"
 
-// ---------------------------------------------------------------------------
-// WaveformDisplay - file drop target + scrubbing waveform view with zoom,
-// scroll and a loop-region selection:
-//
-//   wheel            zoom around the cursor (vertical) / pan (horizontal)
-//   SHIFT + drag     draw a selection -> becomes the LOOP region
-//   ALT  + click     clear selection (loop back to the full file)
-//   double click     reset zoom to the full file
-//   drag             scrub within the visible window
-//
-// The playhead reads the processor's live transport; while FREEZE is
-// engaged a marker flags the parked position.
-// ---------------------------------------------------------------------------
+// Drop target + scrub/zoom/scroll/selection view. SHIFT+drag selects the
+// loop region, ALT+click clears, double-click resets zoom.
 class WaveformDisplay : public juce::Component,
                           public juce::FileDragAndDropTarget,
                           private juce::Timer
@@ -28,7 +17,7 @@ public:
     explicit WaveformDisplay (StretchAudioProcessor& proc)
         : processor (proc)
     {
-        // View controls: zoom in / out / fit, top-right of the inner card.
+        // View controls: zoom in / out / fit.
         // Zooming IN shrinks the visible span; both stay centred.
         zoomInButton.onClick  = [this] { centreViewOn (viewStart + viewLen * 0.5); setZoom (viewLen / kWheelZoomStep); };
         zoomOutButton.onClick = [this] { centreViewOn (viewStart + viewLen * 0.5); setZoom (viewLen * kWheelZoomStep); };
@@ -37,7 +26,7 @@ public:
         for (auto* b : { &zoomInButton, &zoomOutButton, &zoomFitButton })
             addAndMakeVisible (b);
 
-        // Unload ("X"): bottom-right of the inner card, 5px insets.
+        // Unload ("X").
         unloadButton.onClick = [this]
         {
             processor.unloadSample();
@@ -58,9 +47,7 @@ public:
         buildPeakMips();
         unloadButton.setVisible (! thumbnailSamples.isEmpty());
 
-        // Local reset only — don't push to the processor, which holds the
-        // persisted view/loop (preserved across editor recreation, or already
-        // defaulted by installLoadedFile for a brand-new file).
+        // Local reset only; the processor holds the persisted view/loop.
         viewStart = 0.0;
         viewLen = 1.0;
         selStart = 0.0;
@@ -81,8 +68,7 @@ public:
         repaint();
     }
 
-    // Re-apply view + selection from the processor (survives editor
-    // recreation and host state restore). Call after setBuffer().
+    // Re-apply view + selection from the processor. Call after setBuffer().
     void restoreFromProcessor()
     {
         viewLen  = juce::jlimit (kMinViewLen, 1.0, processor.getWaveViewLen());
@@ -90,8 +76,7 @@ public:
 
         const double ls = processor.getLoopStart();
         const double le = processor.getLoopEnd();
-        // Processor (0,1) is the "no selection" sentinel (matches
-        // clearSelection), so only a real sub-range is applied.
+        // (0,1) is the "no selection" sentinel; only apply real sub-ranges.
         if (ls > 0.0 || le < 1.0)
         {
             selStart = ls;
@@ -138,7 +123,7 @@ public:
         const float s = scaleFor (*this);
         auto inner = getLocalBounds().reduced ((int) GUI::Layout::CardInset());
 
-        // Zoom cluster: top-right corner of the inner card.
+        // Zoom cluster: top-right of the inner card.
         const int zw = juce::roundToInt (22.0f * s);
         const int zh = juce::roundToInt (18.0f * s);
         const int gap = juce::roundToInt (4.0f * s);
@@ -149,7 +134,7 @@ public:
         zoomOutButton.setBounds (zx + zw + gap, zy, zw, zh);
         zoomFitButton.setBounds (zx + 2 * (zw + gap), zy, zw, zh);
 
-        // Unload button: bottom-right corner of the inner card, 5px insets.
+        // Unload button: bottom-right of the inner card.
         const int unloadSize = juce::roundToInt (22.0f * s);
         const int inset = juce::roundToInt (5.0f * s);
         unloadButton.setBounds (inner.getRight() - unloadSize - inset,
@@ -197,7 +182,23 @@ public:
     void mouseDown (const juce::MouseEvent& e) override
     {
         if (thumbnailSamples.isEmpty())
+        {
+            // Empty area click offers the file browser; deferred a turn so
+            // modal-in-mouseDown can't swallow the selection signal.
+            if (! fileChooserOpen && onFileDropped)
+            {
+                juce::Component::SafePointer<WaveformDisplay> safeThis { this };
+                fileChooserOpen = true;
+                juce::MessageManager::callAsync ([safeThis]
+                {
+                    if (safeThis == nullptr)
+                        return;
+                    safeThis->fileChooserOpen = false;
+                    safeThis->openFileChooser();
+                });
+            }
             return;
+        }
 
         // Scrollbar thumb takes priority when hit.
         if (getScrollbarArea().contains (e.position.toInt())
@@ -248,8 +249,7 @@ public:
             if (track.getWidth() <= 0)
                 return;
 
-            // The thumb's left edge IS the view start (same scale as the
-            // track), so dragging maps 1:1 onto the window offset.
+            // Thumb left edge == view start, so dragging maps 1:1 to offset.
             const float x = e.position.x - scrollbarDragOffset - (float) track.getX();
             scrollToStart ((double) x / (double) track.getWidth());
             return;
@@ -302,9 +302,32 @@ public:
     std::function<void (const juce::File&)> onFileDropped;
 
 private:
-    // Peak pyramid over the whole file: level 0 holds the max of every
-    // kMipBaseBucket-sample run, each next level maxes 4 of the previous
-    // buckets. Total memory is ~1.33x a level-0 pass (total/256 floats).
+    // File browser; wildcard mirrors isInterestedInFileDrag.
+    void openFileChooser()
+    {
+        static const juce::String audioWildcard =
+            "*.wav;*.wave;*.mp3;*.aiff;*.aif;*.flac;*.ogg";
+
+        auto chooser = std::make_shared<juce::FileChooser> (
+            "Select Audio File",
+            juce::File::getSpecialLocation (juce::File::userDesktopDirectory),
+            audioWildcard);
+
+        juce::Component::SafePointer<WaveformDisplay> safeThis { this };
+        chooser->launchAsync (
+            juce::FileBrowserComponent::openMode
+                | juce::FileBrowserComponent::canSelectFiles,
+            [safeThis, chooser] (const juce::FileChooser& fc)
+            {
+                if (safeThis == nullptr)
+                    return;
+                const juce::File file = fc.getResult();
+                if (file.existsAsFile() && safeThis->onFileDropped)
+                    safeThis->onFileDropped (file);
+            });
+    }
+    // Whole-file peak pyramid: level 0 maxes each 256-sample run, each next
+    // level maxes 4 buckets (~1.33x one pass).
     struct MipLevel
     {
         int64_t bucketSize = 0;
@@ -313,9 +336,7 @@ private:
 
     static constexpr int64_t kMipBaseBucket = 256;
 
-    // ---- View model -----------------------------------------------------
-    // The view is a window [viewStart, viewStart + viewLen] over the file's
-    // normalized timeline (both fractions). Full view == unzoomed overview.
+    // View window [viewStart, viewStart + viewLen] over normalized time.
 
     static constexpr double kMinViewLen = 1.0 / 512.0;   // max zoom-in
     static constexpr float  kWheelZoomStep = 1.15f;
@@ -329,6 +350,7 @@ private:
     double fileSampleRate = 0.0;
     juce::Array<float> thumbnailSamples;
     bool isDragOver = false;
+    bool fileChooserOpen = false;
 
     double viewStart = 0.0;
     double viewLen = 1.0;
@@ -348,8 +370,7 @@ private:
     StretchIconButton zoomOutButton { StretchIconButton::Glyph::Minus };
     StretchIconButton zoomFitButton { StretchIconButton::Glyph::Fit };
 
-    // ---- Geometry -------------------------------------------------------
-
+    // Geometry
     juce::Rectangle<float> getWaveArea() const
     {
         const float s = scaleFor (*this);
@@ -392,13 +413,11 @@ private:
         return viewStart + rel * viewLen;
     }
 
-    // ---- View mutations -------------------------------------------------
-
+    // View mutations
     void setZoom (double newLen)
     {
         viewLen = juce::jlimit (kMinViewLen, 1.0, newLen);
-        // No peak rebuild here: every caller follows up with a scroll
-        // (which rebuilds), so this avoids one redundant full-range scan.
+        // No peak rebuild: callers always scroll next (which rebuilds).
         viewStart = juce::jlimit (0.0, 1.0 - viewLen, viewStart);
     }
 
@@ -429,7 +448,7 @@ private:
         selStart = juce::jlimit (0.0, 1.0, juce::jmin (a, b));
         selEnd   = juce::jlimit (0.0, 1.0, juce::jmax (a, b));
 
-        // A degenerate drag (< ~1 ms of audio worth) counts as empty.
+        // Sub-8-sample drags count as empty.
         if (sourceBuffer != nullptr
             && (selEnd - selStart) * (double) sourceBuffer->getNumSamples() < 8.0)
             clearSelection();
@@ -446,8 +465,7 @@ private:
         processor.setLoopRegion (0.0, 1.0);
     }
 
-    // ---- Painting -------------------------------------------------------
-
+    // Painting
     void timerCallback() override
     {
         if (isVisible())
@@ -487,11 +505,8 @@ private:
         }
     }
 
-    // Per-pixel peak cache for the CURRENT view. Deep zoom (at most one
-    // base bucket per pixel) reads the source directly; anything wider
-    // reads the mip pyramid, so a rebuild costs O(pixels) instead of
-    // O(file) at overview zoom. Rebuilt only when the view geometry
-    // changes (not per frame).
+    // Per-pixel peaks for the current view. Deep zoom reads the source
+    // directly; wider views read the mip pyramid (O(pixels), not O(file)).
     void rebuildViewPeaks()
     {
         const int width = juce::jmax (1, (int) getWaveArea().getWidth());
@@ -657,8 +672,7 @@ private:
         const float x = bounds.getX()
             + (float) ((pos - viewStart) / viewLen) * bounds.getWidth();
 
-        // Parked-playhead flag: bright diamond above the waveform plus a
-        // dashed hold line down through it.
+        // Parked-playhead flag + dashed hold line.
         g.setColour (GUI::Color::Accent);
         const float s = scaleFor (*this);
 
@@ -685,7 +699,6 @@ private:
         const float x1 = bounds.getX()
             + (float) ((selEnd - viewStart) / viewLen) * bounds.getWidth();
 
-        // Clip to what is actually visible.
         const float cx0 = juce::jmax (bounds.getX(), x0);
         const float cx1 = juce::jmin (bounds.getRight(), x1);
         if (cx1 <= cx0)
@@ -720,7 +733,7 @@ private:
         }
     }
 
-    // Scrub maps the click into the VISIBLE window, not the whole file.
+    // Scrub maps the click into the visible window, not the whole file.
     void seekFromEvent (const juce::MouseEvent& e)
     {
         if (thumbnailSamples.isEmpty())

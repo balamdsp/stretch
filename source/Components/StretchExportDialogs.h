@@ -7,16 +7,7 @@
 
 namespace StretchExportDialogs { StretchLookAndFeel& sharedLookAndFeel(); }
 
-// ---------------------------------------------------------------------------
-// Purpose-built export dialogs (fixed-size, no AlertWindow sizing quirks).
-// Non-modal DocumentWindows, same ownership model as SettingsWindow.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// StretchExportDialog - dark card + title strip + message + button row,
-// styled like the FX/transport cards. The primary button fires onConfirm
-// and closes; the secondary (or the window's close box) just closes.
-// ---------------------------------------------------------------------------
+// Fixed-size non-modal card dialogs.
 class StretchExportDialog : public juce::Component
 {
 public:
@@ -126,9 +117,7 @@ private:
             dw->closeButtonPressed();
     }
 
-    // Dialogs are smaller than the 1000px design width, so scaling uses the
-    // explicit zoom scale captured at construction (width-derived Metrics is
-    // only valid for the full-width panels).
+    // Full-width Metrics invalid here; dialogs are narrower than 1000px.
     const float layerScale;
 
     static constexpr int kTitleInsetPx = 5;
@@ -143,11 +132,7 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchExportDialog)
 };
 
-// ---------------------------------------------------------------------------
-// StretchExportProgressDialog - live export status: percentage readout +
-// terminal-style bar + CANCEL. Polls a caller-supplied getter on a short
-// timer, so no cross-thread UI calls ever happen directly.
-// ---------------------------------------------------------------------------
+// Live progress card; polls the getter on a timer (never touches UI off-thread).
 class StretchExportProgressDialog : public juce::Component,
                                     private juce::Timer
 {
@@ -156,7 +141,7 @@ public:
                                  std::function<double()> progressGetter,
                                  std::function<void()> onCancel,
                                  float scale = Zoom::uiScale)
-        : getProgress (std::move (progressGetter)), cancelHandler (std::move (onCancel)), layerScale (scale)
+        : layerScale (scale), getProgress (std::move (progressGetter)), cancelHandler (std::move (onCancel))
     {
         setLookAndFeel (&StretchExportDialogs::sharedLookAndFeel());
 
@@ -270,14 +255,11 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchExportProgressDialog)
 };
 
-// ---------------------------------------------------------------------------
-// StretchNameEntryDialog - SAVE PRESET AS flow: title strip + editable name
-// field + SAVE/CANCEL. Same chrome and ownership model as the export cards.
-// ---------------------------------------------------------------------------
 class StretchNameEntryDialog : public juce::Component
 {
 public:
     StretchNameEntryDialog (const juce::String& title,
+                            const juce::String& message,
                             const juce::String& initialText,
                             std::function<void (const juce::String&)> onAcceptFn,
                             float scale = Zoom::uiScale)
@@ -289,6 +271,12 @@ public:
         titleLabel.setFont (StretchLookAndFeel::makeFont (19.0f * layerScale));
         titleLabel.setColour (juce::Label::textColourId, GUI::Color::Logo.withAlpha (0.5f));
         addAndMakeVisible (titleLabel);
+
+        messageLabel.setText (message, juce::dontSendNotification);
+        messageLabel.setFont (StretchLookAndFeel::makeFont (22.0f * layerScale));
+        messageLabel.setColour (juce::Label::textColourId, StretchColors::textPrimary);
+        messageLabel.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (messageLabel);
 
         nameEditor.setMultiLine (false, false);
         nameEditor.setReturnKeyStartsNewLine (false);
@@ -345,6 +333,8 @@ public:
 
         area.removeFromBottom (rowGap);
         nameEditor.setBounds (area.removeFromBottom (m.sc (36)));
+        area.removeFromBottom (rowGap);
+        messageLabel.setBounds (area);
     }
 
 private:
@@ -369,6 +359,7 @@ private:
     const float layerScale;
 
     juce::Label titleLabel;
+    juce::Label messageLabel;
     juce::TextEditor nameEditor;
     StretchFxTextButton saveButton;
     StretchFxTextButton cancelButton;
@@ -376,12 +367,7 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchNameEntryDialog)
 };
 
-// ---------------------------------------------------------------------------
-// StretchExportOptionsDialog - global export choices as three rows of
-// exclusive terminal-style toggles: RATE / BIT DEPTH / FORMAT. 32-bit float
-// is WAV-only: picking AIFF or FLAC while 32F is selected falls back to
-// 24-bit automatically.
-// ---------------------------------------------------------------------------
+// RATE / DEPTH / FORMAT toggles. 32F is WAV-only: AIFF/FLAC fall back to 24.
 class StretchExportOptionsDialog : public juce::Component
 {
 public:
@@ -496,9 +482,7 @@ public:
     }
 
 private:
-    // Row factory: labelled strip of exclusive-toggle terminal buttons.
-    // Each row owns its buttons; onClick makes the row exclusive and fires
-    // onSelect with the index inside THAT row.
+    // Exclusive-toggle row; onSelect fires with the index in this row.
     juce::Array<juce::Button*> makeRow (juce::OwnedArray<StretchFxTextButton>& storage,
                                         const juce::String& label,
                                         const juce::StringArray& captions,
@@ -588,12 +572,7 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchExportOptionsDialog)
 };
 
-// ---------------------------------------------------------------------------
-// StretchExportDialogWindow - non-modal wrapper matching the Audio/MIDI
-// Settings window exactly (same background colour, all buttons, and the
-// JUCE-drawn title bar styled by the app-wide default LookAndFeel).
-// Owns its dialog content; self-deletes when closed.
-// ---------------------------------------------------------------------------
+// Non-modal wrapper; self-deletes on close.
 class StretchExportDialogWindow : public juce::DocumentWindow
 {
 public:
@@ -604,9 +583,7 @@ public:
         setResizable (false, false);
     }
 
-    // The base implementation is an empty no-op in JUCE 9 -- without this
-    // override neither the close box nor any button routed through
-    // closeButtonPressed() would dismiss the window.
+    // Base closeButtonPressed is a no-op in JUCE 9; without this nothing closes.
     void closeButtonPressed() override { delete this; }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchExportDialogWindow)
@@ -614,19 +591,14 @@ public:
 
 namespace StretchExportDialogs
 {
-    // Static L&F for all export dialogs: Component::setLookAndFeel does NOT
-    // take ownership (ERRATA.md leak lesson); a function-local static gives
-    // one instance shared by every dialog lifetime.
+    // setLookAndFeel takes no ownership; one shared static for all dialogs.
     inline StretchLookAndFeel& sharedLookAndFeel()
     {
         static StretchLookAndFeel lnf;
         return lnf;
     }
 
-    // Any card-dialog component; owned by the window from here on. The base
-    // design size is scaled by the dialog's zoom layer so cards stay
-    // proportional at any UI scale (the dialog component sizes itself off
-    // the same layerScale in resized()).
+    // Window takes ownership; sizes scale with the dialog zoom.
     template <typename DialogType>
     inline StretchExportDialogWindow* openWindow (DialogType* ownedDialog,
                                                   juce::Component* centreOn,
@@ -676,9 +648,7 @@ namespace StretchExportDialogs
                     nullptr, 620, 230);
     }
 
-    // Live export progress card. Returns the window so the caller can close
-    // it programmatically when the render completes (the user may also close
-    // it manually at any time).
+    // Caller closes it when the render completes.
     inline StretchExportDialogWindow* showProgress (const juce::String& title,
                                                     std::function<double()> progressGetter,
                                                     std::function<void()> onCancel,
@@ -690,19 +660,18 @@ namespace StretchExportDialogs
                            centreOn, 500, 240);
     }
 
-    // Name-entry card ("SAVE PRESET AS..."). onAccept fires with the typed
-    // text (possibly empty — callers decide), then the window closes.
+    // onAccept fires with the typed text (may be empty), then closes.
     inline void askForName (const juce::String& title,
+                            const juce::String& message,
                             const juce::String& initialText,
                             juce::Component* centreOn,
                             std::function<void (const juce::String&)> onAccept)
     {
-        openWindow (new StretchNameEntryDialog (title, initialText, std::move (onAccept)),
+        openWindow (new StretchNameEntryDialog (title, message, initialText, std::move (onAccept)),
                     centreOn, 500, 240);
     }
 
-    // Export options card: rate / depth / format. onAccept carries the
-    // chosen triple (rate 0 == source) after OK; CANCEL just closes.
+    // Rate 0 == source. OK fires onAccept, CANCEL just closes.
     inline void showExportOptions (int currentRate, int currentDepth, int currentFormat,
                                    juce::Component* centreOn,
                                    std::function<void (int, int, int)> onAccept)

@@ -8,32 +8,9 @@
 #include "CRTMath.h"
 #include "CRTNoise.h"
 
-// ---------------------------------------------------------------------------
-// CRTScreen - an OpenGL (GPU) port of the cool-retro-term shader pipeline
-// (terminal_static.frag + terminal_dynamic.frag/.vert + terminal_frame.frag +
-// burn_in.frag), rendering the plugin UI as a PET-green CRT through a
-// translucent glass frame. The window is entirely screen + glass: no cabin,
-// bezel band or branding.
-//
-// Each frame:
-//
-//   1. A 30 Hz UI-thread Timer snapshots the full-bleed UI and uploads it to an
-//      OpenGLTexture.
-//   2. bloom pass   : 1/4-res downscale + luma-in-alpha + 5x5 Gaussian.
-//   3. static pass  : curvature + mirror-wrap, RGB shift, bloom halo,
-//      reflection term, brightness, dither            -> screenFBO
-//   4. frame pass   : procedural glass panel            -> frameFBO
-//   5. dynamic pass : vertex noise, shear, jitter, grain, glow line, burn-in
-//      ghost, scanlines, PET chroma, frame blend        -> dynamicFBO
-//   6. burn-in pass : max-blend phosphor persistence (ping-pong FBOs).
-//   7. present      : dynamicFBO + frameFBO composited to the window.
-//
-// When the CRT is disabled (the processor's "CRT Enabled" flag), the snapshot
-// texture is presented raw - full-bleed UI, no tube.
-//
-// Shaders are embedded GLSL 1.20 (JUCE's default Windows context is a legacy
-// 2.1 compatibility profile, so attribute/varying/texture2D style is used).
-// ---------------------------------------------------------------------------
+// OpenGL port of the cool-retro-term pipeline: UI snapshot -> bloom ->
+// static (curve/RGB/bloom) -> glass frame -> dynamic (jitter/scanlines) ->
+// burn-in -> present. Disabled = raw UI, no tube. GLSL 1.20 (legacy GL 2.1).
 class CRTScreen : public juce::Component, public juce::OpenGLRenderer, private juce::Timer
 {
 public:
@@ -72,7 +49,6 @@ public:
 
     void resized() override {}
 
-    // ---- Configuration Setters ---------------------------------------------
     void setBloomIntensity (float amount) noexcept       { bloomIntensity = jlimit (0.0f, 1.0f, amount); }
     void setScanlineIntensity (float amount) noexcept    { scanlineIntensity = jlimit (0.0f, 1.0f, amount); }
     void setGlowingLineIntensity (float amount) noexcept { glowingLineIntensity = jlimit (0.0f, 1.0f, amount); }
@@ -87,6 +63,55 @@ public:
     void setAmbientLight (float amount) noexcept           { ambientLight = jlimit (0.0f, 1.0f, amount); }
     void setFrameShininess (float amount) noexcept         { frameShininess = jlimit (0.0f, 1.0f, amount); }
     void setJitterYScale (float amount) noexcept           { jitterYScale = jlimit (0.0f, 2.0f, amount); }
+
+    // 0 = Low, 1 = Medium, 2 = High. High = original defaults.
+    void setCrtStrength (int strength) noexcept
+    {
+        strength = jlimit (0, 2, strength);
+
+        if (strength == 0)
+        {
+            bloomIntensity          = 0.45f;
+            scanlineIntensity       = 0.15f;
+            glowingLineIntensity    = 0.08f;
+            flickerIntensity        = 0.03f;
+            burnInIntensity         = 0.0f;
+            curvatureIntensity      = 0.10f;
+            staticNoiseIntensity    = 0.02f;
+            rgbShiftIntensity       = 0.015f;
+            jitterIntensity         = 0.05f;
+            jitterYScale            = 0.05f;
+            horizontalSyncIntensity = 0.0f;
+        }
+        else if (strength == 1)
+        {
+            bloomIntensity          = 0.70f;
+            scanlineIntensity       = 0.25f;
+            glowingLineIntensity    = 0.16f;
+            flickerIntensity        = 0.08f;
+            burnInIntensity         = 0.005f;
+            curvatureIntensity      = 0.18f;
+            staticNoiseIntensity    = 0.05f;
+            rgbShiftIntensity       = 0.03f;
+            jitterIntensity         = 0.16f;
+            jitterYScale            = 0.16f;
+            horizontalSyncIntensity = 0.0f;
+        }
+        else
+        {
+            bloomIntensity          = 0.95f;
+            scanlineIntensity       = 0.35f;
+            glowingLineIntensity    = 0.25f;
+            flickerIntensity        = 0.15f;
+            burnInIntensity         = 0.015f;
+            curvatureIntensity      = 0.25f;
+            staticNoiseIntensity    = 0.08f;
+            rgbShiftIntensity       = 0.05f;
+            jitterIntensity         = 0.30f;
+            jitterYScale            = 0.30f;
+            horizontalSyncIntensity = 0.0f;
+        }
+    }
 
     float getBloomIntensity() const noexcept              { return bloomIntensity; }
     float getScanlineIntensity() const noexcept           { return scanlineIntensity; }
@@ -103,19 +128,36 @@ public:
     float getFrameShininess() const noexcept              { return frameShininess; }
     float getJitterYScale() const noexcept               { return jitterYScale; }
 
-    // True when the CRT pipeline is disabled: the overlay presents the raw UI
-    // full-bleed for comparison (session-only flag owned by the processor).
+    // Disabled = raw full-bleed UI (flag owned by the processor).
     bool isCrtEnabled() const noexcept { return enabledFlag == nullptr || enabledFlag->load(); }
 
-    // The tube pad (bezel half-width in window units). The panel squeezes the
-    // UI into [pad, 1-pad] with a real screen transform and the frame shader's
-    // tube SDF uses the same pad, so content, bezel and input all line up.
+    // GL surface pixel scale; display scale first, GL fallback.
+    float getPhysicalScale() const noexcept
+    {
+        if (auto* d = Desktop::getInstance().getDisplays().getDisplayForRect (getScreenBounds()))
+            if (d->scale > 0.0)
+                return (float) d->scale;
+        const double s = openGLContext.getRenderingScale();
+        return (s > 0.0) ? (float) s : 1.0f;
+    }
+
+    // One-shot log when cached scale disagrees (AU diagnosis).
+    void logScaleMismatchOnce (float usedScale) const noexcept
+    {
+        if (! scaleMismatchLogged.exchange (true))
+        {
+            const double juceScale = openGLContext.getRenderingScale();
+            if (std::abs (juceScale - (double) usedScale) > 1.0e-6)
+                Logger::writeToLog ("Stretch CRT: JUCE scale " + juce::String (juceScale)
+                    + " != display scale " + juce::String (usedScale));
+        }
+    }
+
+    // Tube pad (bezel half-width); content, SDF and input share it.
     static constexpr float getFrameSize() noexcept { return kFrameSize; }
 
 private:
-    // Per-frame snapshot of the tunable parameters, produced on the UI thread
-    // (timerCallback) and consumed by the GL thread. Must be declared before
-    // any member function signature uses it.
+    // UI-thread params for the GL thread (declared first: used in signatures).
     struct Params
     {
         float bloom = 0.0f;
@@ -133,9 +175,7 @@ private:
         float frameShininess = 0.0f;
     };
 
-    // =========================================================================
     // OpenGLRenderer
-    // =========================================================================
 
     void newOpenGLContextCreated() override
     {
@@ -156,16 +196,18 @@ private:
         if (! openGLContext.isActive())
             return;
 
-        const int w = getWidth();
-        const int h = getHeight();
+        const float renderScale = getPhysicalScale();
+        logScaleMismatchOnce (renderScale);
+        lastRenderScale.store (renderScale);
+        const int w = jmax (1, roundToInt (getWidth() * renderScale));
+        const int h = jmax (1, roundToInt (getHeight() * renderScale));
         if (screenSource == nullptr || w <= 0 || h <= 0)
             return;
 
         if (! shadersReady())
             return;
 
-        // Publish the latest UI snapshot + params (both produced on the UI
-        // thread by timerCallback) to the GL thread.
+    // Publish UI snapshot + params (UI thread) to the GL thread.
         Params renderParams;
         Image snapToUpload;
         {
@@ -210,9 +252,7 @@ private:
         }
     }
 
-    // =========================================================================
     // GL resource lifecycle
-    // =========================================================================
 
     void detachGL()
     {
@@ -246,7 +286,7 @@ private:
         if (program->link())
             return program;
 
-        Logger::writeToLog ("Morphex CRT shader link failed: " + program->getLastError());
+        Logger::writeToLog ("Stretch CRT shader link failed: " + program->getLastError());
         return nullptr;
     }
 
@@ -285,8 +325,7 @@ private:
         lastFrameTime = 0.0f;
     }
 
-    // The periodic noise tile: built once on the GL thread, wrapped (REPEAT)
-    // like cool-retro-term's noiseSource sampler.
+    // Noise tile: built once on the GL thread, REPEAT-wrapped.
     void ensureNoiseTexture()
     {
         if (noiseTexture.getTextureID() != 0)
@@ -303,9 +342,7 @@ private:
         gl::glBindTexture (gl::GL_TEXTURE_2D, 0);
     }
 
-    // Per-frame "vertex pass" on the CPU: bilinear-wrap sample of the noise tile
-    // at the two slow `fract(time/n)` coords, producing vBrightness /
-    // vDistortionScale / vDistortionFreq.
+    // CPU "vertex pass": noise-tile sample -> brightness/distortion uniforms.
     void computeVertexPass (float timeSec, float flickering, float horizontalSync,
                             float horizontalSyncStrength,
                             float& vBrightness, float& vDistortionScale, float& vDistortionFreq) const
@@ -377,26 +414,12 @@ private:
         recreate (burnFBO[1], w, h);
     }
 
-    // =========================================================================
     // Drawing helpers
-    // =========================================================================
 
-    // The fullscreen quad is a triangle strip. Two orientations share the same
-    // vertex shader. Orientation conventions:
-    //
-    //   - OpenGLTexture::loadImage() uploads the snapshot VERTICALLY FLIPPED,
-    //     so every texture here stores "image bottom at v=0" (the GL-native
-    //     orientation: v=1 is the framebuffer's top row).
-    //   - Rendering INTO an FBO with the flipped quad (texCoord.y=0 at the
-    //     target's bottom, v=1 at its top) makes the pass PRESERVE that
-    //     orientation, so the sampled passes (bloom/static/dynamic/burn-in)
-    //     never flip the image.
-    //   - The frame pass is procedural (no source texture), so its quad
-    //     chooses its orientation: the NORMAL quad (v=0 at the target top,
-    //     v=1 at its bottom) leaves the glass frame upright in the same
-    //     v=0=image-bottom convention.
-    //   - Presenting to the window uses the FLIPPED quad so the window top
-    //     samples v=1 = the image top.
+    // Fullscreen triangle strip. loadImage() uploads VERTICALLY FLIPPED
+    // (v=0 = image bottom); the flipped quad preserves that into FBOs,
+    // the normal quad is for the procedural frame pass, and present uses
+    // flipped so the window top samples the image top.
     static void drawFullscreen (const OpenGLShaderProgram& program, bool flipped)
     {
         static const float quads[8][4] =
@@ -430,7 +453,7 @@ private:
 
     static void bindTextureUnit (int unit, GLuint id)
     {
-        gl::glActiveTexture (gl::GL_TEXTURE0 + unit);
+        gl::glActiveTexture ((GLenum) (gl::GL_TEXTURE0 + (GLenum) unit));
         gl::glBindTexture (gl::GL_TEXTURE_2D, id);
     }
 
@@ -440,11 +463,9 @@ private:
         bindTextureUnit (unit, id);
     }
 
-    // =========================================================================
     // Render passes
-    // =========================================================================
 
-    void renderBloomPass (const Params& p)
+    void renderBloomPass ([[maybe_unused]] const Params& p)
     {
         bloomFBO->makeCurrentRenderingTarget();
         gl::glViewport (0, 0, bloomFBO->getWidth(), bloomFBO->getHeight());
@@ -466,11 +487,9 @@ private:
         staticProgram->use();
         bindSampler (*staticProgram, "source", 0, uiTexture.getTextureID());
         bindSampler (*staticProgram, "bloomSource", 1, bloomFBO->getTextureID());
-        // Input-mismatch fix (to-do.md item 11): the content is 1:1 with the
-        // window (the squeeze to the tube is the screen transform now), so the
-        // residual curvature is kept mild to leave clicks within ~5-10px at the
-        // edges. Scaled from the param at 0.2x (default 0.25 -> 0.05 effective).
-        OpenGLShaderProgram::Uniform (*staticProgram, "screenCurvature").set (p.curvature * 0.2f);
+        // Content is 1:1 with the window (tube squeeze is the transform);
+        // mild residual curve keeps clicks within ~5-10px at edges.
+        OpenGLShaderProgram::Uniform (*staticProgram, "screenCurvature").set (p.curvature * kCurvatureScale);
         OpenGLShaderProgram::Uniform (*staticProgram, "rgbShift")
             .set (p.rgbShift * (4.0f / (float) screenFBO->getWidth()));
         OpenGLShaderProgram::Uniform (*staticProgram, "screenBrightness").set (1.0f);
@@ -488,7 +507,7 @@ private:
         gl::glViewport (0, 0, frameFBO->getWidth(), frameFBO->getHeight());
 
         frameProgram->use();
-        OpenGLShaderProgram::Uniform (*frameProgram, "screenCurvature").set (p.curvature * 0.2f);
+        OpenGLShaderProgram::Uniform (*frameProgram, "screenCurvature").set (p.curvature * kCurvatureScale);
         OpenGLShaderProgram::Uniform (*frameProgram, "frameSize").set (kFrameSize);
         OpenGLShaderProgram::Uniform (*frameProgram, "screenRadius").set (kScreenRadius);
         OpenGLShaderProgram::Uniform (*frameProgram, "viewportSize")
@@ -496,10 +515,7 @@ private:
         OpenGLShaderProgram::Uniform (*frameProgram, "ambientLight").set (p.ambientLight);
         OpenGLShaderProgram::Uniform (*frameProgram, "frameShininess").set (p.frameShininess);
 
-        // cool-retro-term's frame colour: mix the dimmed phosphor light colour
-        // with the static frame tint, weighted by ambient light. The frame is
-        // dark here (monochrome restyle) so the mirrored bezel reflection reads
-        // against it.
+        // Frame tint: dimmed phosphor mixed with static grey by ambient.
         const float lightR = crt::mixF (kFontColorR, kBackgroundColorR, 0.2f);
         const float lightG = crt::mixF (kFontColorG, kBackgroundColorG, 0.2f);
         const float lightB = crt::mixF (kFontColorB, kBackgroundColorB, 0.2f);
@@ -521,16 +537,14 @@ private:
 
         const int w = dynamicFBO->getWidth();
         const int h = dynamicFBO->getHeight();
-        // Same mild residual-curvature scaling as the static/frame passes so
-        // the scanline phase tracks the 1:1 screen.
-        const float curvature = p.curvature * 0.2f;
+        // Same mild curve so scanline phase tracks the 1:1 screen.
+        const float curvature = p.curvature * kCurvatureScale;
         const float burnInTime = 1.0f / crt::lint (0.16f, 1.6f, p.burnIn);
         const float bloomU = p.bloom * 2.5f;
 
         dynamicProgram->use();
 
-        // Per-frame "vertex pass" computed on the CPU (no vertex texture fetch,
-        // so no driver-dependent flicker).
+        // CPU vertex pass (no vertex texture fetch: driver flicker on Win).
         float vBrightness = 1.0f;
         float vDistortionScale = 0.0f;
         float vDistortionFreq = 0.0f;
@@ -596,14 +610,17 @@ private:
 
     void presentScene (const Params& p, float timeSec)
     {
-        gl::glViewport (0, 0, getWidth(), getHeight());
+        const float renderScale = getPhysicalScale();
+        const int w = jmax (1, roundToInt (getWidth() * renderScale));
+        const int h = jmax (1, roundToInt (getHeight() * renderScale));
+        gl::glViewport (0, 0, w, h);
 
         presentProgram->use();
         OpenGLShaderProgram::Uniform (*presentProgram, "time").set (timeSec);
         OpenGLShaderProgram::Uniform (*presentProgram, "staticNoise").set (p.staticNoise);
         OpenGLShaderProgram::Uniform (*presentProgram, "scaleNoiseSize")
-            .set ((float) getWidth() * 0.75f / (float) crt::crtNoiseTileSize,
-                  (float) getHeight() * 0.75f / (float) crt::crtNoiseTileSize);
+            .set ((float) w * 0.75f / (float) crt::crtNoiseTileSize,
+                  (float) h * 0.75f / (float) crt::crtNoiseTileSize);
         bindSampler (*presentProgram, "dynamicTexture", 0, dynamicFBO->getTextureID());
         bindSampler (*presentProgram, "frameTexture", 1, frameFBO->getTextureID());
         bindSampler (*presentProgram, "noiseSource", 2, noiseTexture.getTextureID());
@@ -612,16 +629,17 @@ private:
 
     void presentRawUI()
     {
-        gl::glViewport (0, 0, getWidth(), getHeight());
+        const float renderScale = getPhysicalScale();
+        const int w = jmax (1, roundToInt (getWidth() * renderScale));
+        const int h = jmax (1, roundToInt (getHeight() * renderScale));
+        gl::glViewport (0, 0, w, h);
 
         rawUIProgram->use();
         bindSampler (*rawUIProgram, "uiTexture", 0, uiTexture.getTextureID());
         drawFullscreen (*rawUIProgram, true);
     }
 
-    // =========================================================================
     // UI-thread snapshot + parameter publication
-    // =========================================================================
 
     void timerCallback() override
     {
@@ -630,16 +648,13 @@ private:
         if (screenSource->getWidth() <= 0 || screenSource->getHeight() <= 0)
             return;
 
-        Image snap = screenSource->createComponentSnapshot (getLocalBounds(), false, 1.0f);
+        Image snap = screenSource->createComponentSnapshot (getLocalBounds(), false,
+                                                        jmax (1.0f, lastRenderScale.load()));
         if (! snap.isValid())
             return;
 
-        // createComponentSnapshot renders the component through
-        // paintEntireComponent(), which does NOT apply the component's own
-        // AffineTransform -- so the capture comes back full-bleed even though
-        // the live screen is squeezed into the tube. Re-apply the squeeze here:
-        // the GL passes sample 1:1, so this keeps the CRT picture at exactly
-        // the window coordinates the live (transformed) screen hit-tests.
+        // Snapshot ignores the component transform (full-bleed); re-apply
+        // the tube squeeze so the picture matches the live hit-test coords.
         const AffineTransform screenTransform = screenSource->getTransform();
         if (! screenTransform.isIdentity())
         {
@@ -672,9 +687,7 @@ private:
             snapshotPending = true;
         }
 
-        // When the CRT-enabled flag flips (menu toggle, message thread), the
-        // parent must re-run resized() so its screen transform is applied or
-        // removed accordingly (CRT on = squeezed UI, off = raw full-bleed).
+        // On enable-flip, re-run parent resized() for the transform.
         const bool enabled = isCrtEnabled();
         if (enabled != lastEnabled)
         {
@@ -688,9 +701,7 @@ private:
             openGLContext.triggerRepaint();
     }
 
-    // =========================================================================
     // GLSL shaders (cool-retro-term pipeline)
-    // =========================================================================
 
     static constexpr const char* kVertexShader = R"(
 #version 120
@@ -704,11 +715,7 @@ void main()
 }
 )";
 
-    // The per-frame "vertex pass" values (vBrightness / vDistortionScale /
-    // vDistortionFreq) are computed on the CPU from the noise tile and fed in
-    // as uniforms -- vertex texture fetch in GLSL 1.20 is unreliable on some
-    // Windows drivers and produced a driver-dependent whole-screen brightness
-    // pulse.
+    // Vertex pass on CPU: GLSL 1.20 vertex texture fetch is unreliable on Win.
     static constexpr const char* kDynamicVertexShader = R"(
 #version 120
 attribute vec2 position;
@@ -1115,9 +1122,7 @@ void main()
 }
 )";
 
-    // =========================================================================
     // State
-    // =========================================================================
 
     juce::Component* screenSource = nullptr;
 
@@ -1157,6 +1162,7 @@ void main()
     // top/right/bottom edges past the window edge if the frame is too thin).
     static constexpr float kFrameSize   = 0.05f;
     static constexpr float kScreenRadius = 16.0f;
+    static constexpr float kCurvatureScale = 0.2f;
     static constexpr float kFontColorR   = 0.55f;  // green phosphor (#8AFFBE);
     static constexpr float kFontColorG   = 1.00f;  // bloom pushes hot values
     static constexpr float kFontColorB   = 0.76f;  // toward near-white
@@ -1200,6 +1206,11 @@ void main()
     int burnWrite = 1;
 
     float lastFrameTime = 0.0f;
+
+    // Physical render scale read by the GL thread; the CPU-side snapshotter
+    // uses it so the captured UI matches the FBO resolution.
+    std::atomic<float> lastRenderScale { 1.0f };
+    mutable std::atomic<bool> scaleMismatchLogged { false };
 
     bool glAttached = false;
 

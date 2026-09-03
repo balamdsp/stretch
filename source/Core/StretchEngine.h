@@ -2,24 +2,34 @@
 
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_core/juce_core.h>
+
+// Vendored DSP: silence its sign-conversion warnings for this header only.
+#if defined(__GNUC__) || defined(__clang__)
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wsign-conversion"
+ #pragma GCC diagnostic ignored "-Wfloat-equal"
+ #pragma GCC diagnostic ignored "-Wshadow"
+ #pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
+#if defined(_MSC_VER)
+ #pragma warning(push)
+ #pragma warning (disable : 4244 4267 4365)
+#endif
 #include <signalsmith-stretch/signalsmith-stretch.h>
+#if defined(_MSC_VER)
+ #pragma warning(pop)
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+ #pragma GCC diagnostic pop
+#endif
 
 #include <cmath>
 #include <functional>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// StretchEngine - wraps the Signalsmith stretcher with two modes:
-//
-//   Streaming (audio thread): the processor feeds sequential chunks of the
-//   device-rate source buffer through renderBlock(); the time ratio comes
-//   from the input/output sample counts (this vendored API has no
-//   setTimeFactor - see inputSamplesForOutput()). Pitch/formant targets are
-//   cheap setters applied once per block by the processor.
-//
-//   Offline (export): processOffline() runs a dedicated local stretcher so
-//   it never races the audio thread's instance.
-// ---------------------------------------------------------------------------
+// Signalsmith wrapper. Streaming: renderBlock() feeds device-rate chunks
+// (ratio from in/out counts; no setTimeFactor in this API). Offline:
+// processOffline() uses a private instance, never racing the audio thread.
 class StretchEngine
 {
 public:
@@ -34,7 +44,7 @@ public:
 
     void reset() { stretcher.reset(); }
 
-    // Message thread: build/install the device-rate copy of the loaded file.
+    // Message thread: install the device-rate copy of the loaded file.
     void setSource (const juce::AudioBuffer<float>& fileBuffer, double fileSampleRate)
     {
         if (currentSampleRate <= 0 || currentChannels <= 0)
@@ -49,7 +59,7 @@ public:
     const juce::AudioBuffer<float>& getSource() const noexcept { return sourceBuffer; }
     void clearSource() { sourceBuffer.setSize (0, 0); }
 
-    // Cheap per-block stretcher configuration (audio thread).
+    // Cheap per-block stretcher config (audio thread).
     void updateStretcherParams (float pitchSemitones, bool formantPreserve, float formantSemitones)
     {
         stretcher.setTransposeSemitones (pitchSemitones);
@@ -60,11 +70,8 @@ public:
             stretcher.setFormantFactor (1.0f, false);
     }
 
-    // Source-domain samples consumed (MAGNITUDE ONLY) to produce numOutput
-    // samples. RATE semantics: 100 % consumes 1:1, 400 % four times as fast,
-    // a ratio of 0 consumes nothing -> the stretcher holds its grains
-    // (stillness / playback freeze). Direction is the caller's concern: a
-    // negative rate plays backward, feeding the source in decreasing order.
+    // Source samples consumed (magnitude) per output block. 100% = 1:1,
+    // 0 = stillness (freeze). Sign (direction) is the caller's concern.
     static int inputSamplesForOutput (int numOutput, float rate) noexcept
     {
         const double safeRate = juce::jlimit (0.0, 20.0, (double) std::abs (rate));
@@ -72,8 +79,8 @@ public:
     }
 
     // Audio thread: stretch numInput source samples into numOutput samples.
-    void renderBlock (const float* const* inputChannelData, int numInputChannels, int numInputSamples,
-                      float* const* outputChannelData, int numOutputChannels, int numOutputSamples)
+    void renderBlock (const float* const* inputChannelData, [[maybe_unused]] int numInputChannels, int numInputSamples,
+                      float* const* outputChannelData, [[maybe_unused]] int numOutputChannels, int numOutputSamples)
     {
         struct InAccessor
         {
@@ -95,9 +102,7 @@ public:
     double getSampleRate() const noexcept { return currentSampleRate; }
     int getChannels() const noexcept { return currentChannels; }
 
-    // Catmull-Rom resample of a whole buffer (non-realtime contexts: load
-    // time and the export worker). Public so the exporter can convert its
-    // render to a user-chosen fixed sample rate.
+    // Catmull-Rom whole-buffer resample (load time + export worker).
     static void resampleInto (const juce::AudioBuffer<float>& src, double srcRate,
                               juce::AudioBuffer<float>& dst, double dstRate)
     {
@@ -138,15 +143,10 @@ public:
         }
     }
 
-    // Message thread (export): full offline render with a private stretcher.
-    // timeStretchRatio is a MAGNITUDE (backward exports pass a reversed
-    // buffer); maxOutputSamples > 0 hard-caps the rendered length.
-    //
-    // progress: called after each chunk with 0..1; return false to cancel
-    // (the render then returns an empty buffer). Rendering is chunked so a
-    // background export can report progress and stay cancellable — the
-    // stretcher is a streaming STFT, sequential process() calls are its
-    // native mode, so chunking is continuity-safe by construction.
+    // Offline render with a private stretcher. Ratio is a magnitude
+    // (backward exports pre-reverse the buffer); maxOutputSamples caps.
+    // progress returns false to cancel. Chunked for progress/cancel;
+    // chunking is continuity-safe (streaming STFT).
     using OfflineProgressFn = std::function<bool (double progress)>;
 
     juce::AudioBuffer<float> processOffline (
@@ -177,7 +177,7 @@ public:
         else
             offlineStretcher.setFormantFactor (1.0f, false);
 
-        // RATE semantics: faster playback -> shorter output.
+        // RATE: faster playback -> shorter output.
         const double safeRate = juce::jlimit (0.05, 20.0, (double) std::abs (timeStretchRatio));
         int outputSamples = juce::jmax (1, (int) ((double) inputSamples / safeRate));
 
@@ -205,8 +205,7 @@ public:
             float* operator[] (int c) const { return ch[c]; }
         };
 
-        // ~170 ms of audio at 48 kHz per chunk: fine enough for a smooth
-        // progress bar, coarse enough that per-call overhead is negligible.
+        // ~170ms chunks at 48k: smooth progress, negligible overhead.
         constexpr int kChunkOut = 8192;
 
         int outDone = 0;
@@ -217,8 +216,7 @@ public:
             const bool lastChunk = (outputSamples - outDone) <= kChunkOut;
             const int chunkOut = juce::jmin (kChunkOut, outputSamples - outDone);
 
-            // Match the aggregate consumption exactly: the final chunk takes
-            // whatever input remains, absorbing per-chunk rounding.
+            // Final chunk absorbs rounding so totals match exactly.
             int chunkIn = juce::jmin (
                 StretchEngine::inputSamplesForOutput (chunkOut, (float) safeRate),
                 inputSamples - inDone);
@@ -249,7 +247,7 @@ public:
 
 private:
     signalsmith::stretch::SignalsmithStretch<float> stretcher;
-    juce::AudioBuffer<float> sourceBuffer; // device-rate copy (guarded by processor's mutex)
+    juce::AudioBuffer<float> sourceBuffer; // device-rate copy (processor mutex)
 
     double currentSampleRate = 0;
     int currentChannels = 0;

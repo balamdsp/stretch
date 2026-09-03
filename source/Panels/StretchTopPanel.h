@@ -18,10 +18,7 @@
 
 class StretchAudioProcessor;
 
-// ---------------------------------------------------------------------------
-// HamburgerButton - boxed background plus three hand-drawn bars
-// (VT323 has no U+2630 glyph), brightening on hover.
-// ---------------------------------------------------------------------------
+// Boxed button with three hand-drawn bars (no U+2630 glyph in VT323).
 class StretchHamburgerButton : public juce::TextButton
 {
 public:
@@ -46,13 +43,10 @@ public:
     }
 };
 
-// ---------------------------------------------------------------------------
-// StretchExportButton - drag out the rendered WAV while the mouse is held,
-// or click for a "saved to..." popup. RATE below 10 % warns first (a long
-// render cannot pause mid-drag, so a low-rate drag falls back to the click
-// confirm flow).
-// ---------------------------------------------------------------------------
-class StretchExportButton : public juce::TextButton
+// Drag out the rendered file, or click for a "saved to..." popup. Low RATE
+// can't pause mid-drag, so it falls back to the click confirm flow.
+// Bracket-button paint shared with the preset display (same font sizing).
+class StretchExportButton : public StretchFxTextButton
 {
 public:
     explicit StretchExportButton (StretchAudioProcessor& proc)
@@ -60,12 +54,10 @@ public:
     {
         setButtonText ("EXPORT");
 
-        // An export may already be running when the editor is (re)created
-        // mid-session; stay consistent from the first frame.
+        // May already be running when the editor is recreated mid-session.
         setEnabled (! processor.isExportRunning());
 
-        // Exports complete on a worker thread; this handler runs on the
-        // message thread and swaps the progress card for the result.
+        // Completion arrives on the message thread.
         processor.onExportFinished = [safeThis = juce::Component::SafePointer<StretchExportButton> (this)]
             (bool success, juce::File exported, bool cancelled)
         {
@@ -111,9 +103,8 @@ public:
     }
 
 private:
-    // Dialogs must never be spawned while THIS button still owns the mouse
-    // capture: a modal created inside a click/drag sequence can fail to
-    // surface or take input on Windows. Hop to the next message-loop turn.
+    // Never spawn dialogs while this button holds mouse capture (breaks on
+    // Windows); hop to the next message-loop turn.
     void deferBeginExport (bool allowOsDrag)
     {
         juce::Component::SafePointer<StretchExportButton> safeThis { this };
@@ -126,15 +117,12 @@ private:
 
     void beginExport (bool allowOsDrag)
     {
-        // One render at a time: the button is disabled while an export
-        // runs, so reaching this branch is only possible via a stale async
-        // hop — do nothing rather than stacking a second progress card.
+        // One render at a time; a stale async hop reaching here does nothing.
         if (processor.isExportRunning())
             return;
 
-        // Warn before rendering anything risky: freeze / very low rates
-        // produce endless files (capped to two minutes), other settings may
-        // simply produce a huge one.
+        // Warn before risky renders: freeze/low rates cap at two minutes,
+        // other settings may just be huge.
         const bool lowRate = processor.isFrozen()
                              || std::abs (processor.getRateValue()) < 0.10f;
         const bool hugeFile = processor.estimateExportBytes()
@@ -183,7 +171,7 @@ private:
         closeProgressCard();
 
         progressWindow = StretchExportDialogs::showProgress (
-            ">> EXPORTING",
+            processor.hasActiveSelection() ? ">> EXPORTING SELECTION" : ">> EXPORTING",
             [&processor = processor] { return processor.getExportProgress(); },
             [&processor = processor] { processor.cancelExport(); },
             this);
@@ -233,15 +221,11 @@ private:
     bool dragStarted = false;
     bool dragOnFinish = false;
 
-    // SafePointer: the window self-deletes when closed (button or close box),
-    // and must never be touched again afterwards.
+    // SafePointer: the window self-deletes on close.
     juce::Component::SafePointer<juce::DocumentWindow> progressWindow;
 };
 
-// ---------------------------------------------------------------------------
-// StretchVolumeSlider - top-right master gain readout: "-inf dB" at the
-// range floor, "X dB" / "X.X dB" otherwise.
-// ---------------------------------------------------------------------------
+// Master gain readout: "-inf dB" at the floor, else "X [X] dB".
 class StretchVolumeSlider : public juce::Slider
 {
 public:
@@ -279,6 +263,10 @@ public:
     {
         menuButton.onClick = [this] { showMenu(); };
         addAndMakeVisible (menuButton);
+
+        presetDisplay.setButtonText (processor.presetSession.name);
+        presetDisplay.onClick = [this] { showPresetsMenu(); };
+        addAndMakeVisible (presetDisplay);
 
         addAndMakeVisible (exportButton);
 
@@ -344,29 +332,30 @@ public:
         const float s = scaleFor (*this);
         const int cy = bounds.getCentreY(); // shared centre line with paint()
 
-        const int exportW = (int) (130.0f * s);
+        const int presetW = (int) (150.0f * s);
+        const int exportW = (int) (100.0f * s);
         const int menuW   = (int) (56.0f * s);
         const int ctrlH   = (int) (36.0f * s);
         const int gap     = (int) (10.0f * s);
 
-        const int clusterW = exportW + gap + menuW;
+        const int clusterW = presetW + gap + exportW + gap + menuW;
         const int clusterX = (bounds.getWidth() - clusterW) / 2;
 
-        exportButton.setBounds (clusterX,                 cy - ctrlH / 2, exportW, ctrlH);
-        menuButton.setBounds   (clusterX + exportW + gap, cy - ctrlH / 2, menuW,   ctrlH);
+        presetDisplay.setBounds (clusterX,                              cy - ctrlH / 2, presetW, ctrlH);
+        exportButton.setBounds  (clusterX + presetW + gap,              cy - ctrlH / 2, exportW, ctrlH);
+        menuButton.setBounds    (clusterX + presetW + gap + exportW + gap, cy - ctrlH / 2, menuW, ctrlH);
 
-        // Master gain readout: right zone, on the same centre line. Taller
-        // than the visible track so the L&F can trim the value box's bottom
-        // and optically centre its text against the track.
-        const int volW = juce::jmin ((int) (300.0f * s), bounds.getWidth() / 3);
+        // Right zone, same centre line. Taller than the track so the L&F can
+        // trim the value box bottom and centre its text on the track.
+        // 260px wide: clears the narrowed center cluster with room to spare.
+        const int volW = juce::jmin ((int) (260.0f * s), bounds.getWidth() / 3);
         const int volH = (int) (42.0f * s);
         volumeSlider.setBounds (bounds.getWidth() - volW - (int) (18.0f * s),
                                 cy - volH / 2,
                                 volW, volH);
     }
 
-    // Zoom hook (editor's applyScaledFonts): the master gain textbox carries
-    // an explicit size/font, so it is rebuilt at the new zoom here.
+    // Zoom hook: the gain textbox has an explicit size/font; rebuild it here.
     void applyFontScale (float scale)
     {
         volumeSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false,
@@ -376,11 +365,19 @@ public:
 
     std::function<void()> onSetExportFolder;
     std::function<void()> onViewStateChanged;
+    std::function<void()> onSampleUnloaded;
+    std::function<void (int)> onCrtStrengthChanged;
 
 private:
     void timerCallback() override
     {
         cursorVisible = ! cursorVisible;
+
+        // Preset display follows the session (menu actions update it).
+        const auto& presetName = processor.presetSession.name;
+        if (presetDisplay.getButtonText() != presetName)
+            presetDisplay.setButtonText (presetName);
+
         repaint();
     }
 
@@ -388,9 +385,7 @@ private:
 
     void displayAboutPopup()
     {
-        // About layout: version, one-line descriptor, then a "Based on:" block
-        // with aligned "-- licence" columns. Lines stay short — dialog body
-        // Labels do not word-wrap (ROADMAP §2 constraint 2).
+        // Lines stay short: dialog body labels do not word-wrap.
         const juce::String aboutMessage =
             "Version " + PLUGIN_VERSION
             + "\n\nA pitch & time stretch plugin"
@@ -411,7 +406,34 @@ private:
             nullptr, 500, 600);
     }
 
-    void showMenu()
+    // Preset-only popup for the name display (not the full hamburger menu).
+    void showPresetsMenu()
+    {
+        presetPaths = StretchPresets::listPresets();
+
+        juce::PopupMenu presetSub;
+        buildPresetSubmenu (presetSub);
+        presetSub.showMenuAsync (
+            juce::PopupMenu::Options().withTargetComponent (&presetDisplay),
+            [this] (int result)
+            {
+                handleMenuResult (result);
+            });
+    }
+
+    // Action cluster + recursive list; presetPaths must be fresh (see callers).
+    void buildPresetSubmenu (juce::PopupMenu& presetSub)
+    {
+        presetSub.addItem (kPresetInitId, "Init");
+        presetSub.addItem (kPresetSaveId, "Save");
+            presetSub.addItem (kPresetSaveAsId, "Save As...");
+        presetSub.addItem (kPresetLoadFileId, "Load From File...");
+        presetSub.addSeparator();
+
+        addPresetLevel (presetSub, StretchPresets::presetsFolder());
+    }
+
+    void showMenu (juce::Component* anchor = nullptr)
     {
         juce::PopupMenu menu;
 
@@ -419,11 +441,28 @@ private:
         menu.addItem (2, "Reset Export Folder");
         menu.addItem (11, "Export Options...");
         menu.addSeparator();
-        menu.addItem (3, juce::String ("CRT Enabled - ") + (processor.isCrtEnabled() ? "[X]" : "[ ]"));
+
+        menu.addItem (12, "Set Preset Folder...");
+        menu.addItem (13, "Reset Preset Folder");
         menu.addSeparator();
 
-        // UI zoom: sets the persisted "ui_scale" choice param; the editor
-        // re-sizes itself to STRETCH_PANEL * uiScale on the change.
+        // CRT Layout: enabled toggle + >> Strength submenu; both persist live.
+        {
+            juce::PopupMenu crtSub;
+            crtSub.addItem (3, juce::String ("CRT Enabled - ")
+                            + (processor.isCrtEnabled() ? "[X]" : "[ ]"));
+
+            juce::PopupMenu strengthSub;
+            const int strength = processor.getCrtStrength();
+            strengthSub.addItem (kCrtStrengthBaseId + 0, "Low",  true, strength == 0);
+            strengthSub.addItem (kCrtStrengthBaseId + 1, "Medium", true, strength == 1);
+            strengthSub.addItem (kCrtStrengthBaseId + 2, "High", true, strength == 2);
+            crtSub.addSubMenu (">> Strength", strengthSub);
+
+            menu.addSubMenu (">> CRT Layout", crtSub);
+        }
+
+        // Zoom: writes the persisted "ui_scale" param; the editor resizes.
         {
             juce::PopupMenu zoomSub;
             const int count = (int) StretchZoom::ZOOM_PERCENTS.size();
@@ -435,16 +474,15 @@ private:
 
             for (int i = 0; i < count; ++i)
                 zoomSub.addItem (kZoomBaseId + i,
-                                 juce::String (StretchZoom::ZOOM_PERCENTS[i]) + "%",
+                                 juce::String (StretchZoom::ZOOM_PERCENTS
+                                     [static_cast<size_t> (i)]) + "%",
                                  true, i == currentIdx);
 
-            menu.addSubMenu (">> UI Scale", zoomSub);
+            menu.addSubMenu (">> Zoom", zoomSub);
         }
         menu.addSeparator();
 
-        // Recent files: global list, shared by every format/instance.
-        // Paths are shown inline, truncated from the left so the filename
-        // stays visible (JUCE 9 popup items have no hover-help support).
+        // Recent files: global list; truncated from the left so names show.
         recentPaths = processor.getRecentFiles();
         if (! recentPaths.isEmpty())
         {
@@ -465,28 +503,17 @@ private:
             recentSub.addSeparator();
             recentSub.addItem (kRecentClearId, "Clear List");
             menu.addSubMenu (">> Recent Files...", recentSub);
-            menu.addSeparator();
         }
 
-        // Presets: global XML folder + save-as entry.
         presetPaths = StretchPresets::listPresets();
         {
             juce::PopupMenu presetSub;
-
-            for (int i = 0; i < presetPaths.size(); ++i)
-                presetSub.addItem (kPresetBaseId + i,
-                                   presetPaths[i].getFileNameWithoutExtension());
-
-            if (! presetPaths.isEmpty())
-                presetSub.addSeparator();
-
-            presetSub.addItem (kPresetSaveAsId, "Save Preset As...");
+            buildPresetSubmenu (presetSub);
             menu.addSubMenu (">> Presets", presetSub);
             menu.addSeparator();
         }
 
-        // Runtime gate: plugin sources compile once for all formats, so a
-        // preprocessor guard cannot tell them apart -- wrapperType can.
+        // Preprocessor can't tell formats apart (one binary); wrapperType can.
         if (processor.isRunningAsStandalone())
         {
             juce::PopupMenu standaloneSub;
@@ -502,7 +529,7 @@ private:
 
         menu.showMenuAsync (
             juce::PopupMenu::Options()
-                .withTargetComponent (&menuButton),
+                .withTargetComponent (anchor != nullptr ? anchor : &menuButton),
             [this] (int result)
             {
                 handleMenuResult (result);
@@ -511,8 +538,7 @@ private:
 
     void handleMenuResult (int selectedId)
     {
-        // Standalone-only items can never be triggered in a host (the
-        // submenu is hidden), but guard anyway.
+        // Hidden in hosts, but guard anyway.
         if (selectedId >= 4 && selectedId <= 7 && ! processor.isRunningAsStandalone())
             return;
 
@@ -522,14 +548,23 @@ private:
             return;
         }
 
-        // UI scale choice: write the normalized param value; the editor's
-        // parameterChanged listener applies the zoom.
+        // Zoom writes the normalized value; the editor listener applies it.
         const int zoomIndex = selectedId - kZoomBaseId;
         if (zoomIndex >= 0 && zoomIndex < (int) StretchZoom::ZOOM_PERCENTS.size())
         {
             if (auto* scaleParam = processor.parameters.getParameter (StretchZoom::UI_SCALE_ID))
                 scaleParam->setValueNotifyingHost (
                     (float) zoomIndex / (float) (StretchZoom::ZOOM_PERCENTS.size() - 1));
+            return;
+        }
+
+        // Persists to settings.xml; overlay applies it via the callback.
+        const int crtStrengthIdx = selectedId - kCrtStrengthBaseId;
+        if (crtStrengthIdx >= 0 && crtStrengthIdx < 3)
+        {
+            processor.setCrtStrength (crtStrengthIdx);
+            if (onCrtStrengthChanged)
+                onCrtStrengthChanged (crtStrengthIdx);
             return;
         }
 
@@ -548,16 +583,28 @@ private:
             return;
         }
 
+        if (selectedId == kPresetInitId)
+        {
+            initPresetDialog();
+            return;
+        }
+
+        if (selectedId == kPresetSaveId)
+        {
+            savePreset();
+            return;
+        }
+
+        if (selectedId == kPresetLoadFileId)
+        {
+            loadPresetFileDialog();
+            return;
+        }
+
         const int presetIndex = selectedId - kPresetBaseId;
         if (presetIndex >= 0 && presetIndex < presetPaths.size())
         {
-            StretchPresets::ViewState vs;
-            StretchPresets::load (presetPaths[presetIndex], processor.parameters, vs);
-            processor.setWaveViewStart (vs.viewStart);
-            processor.setWaveViewLen (vs.viewLen);
-            processor.setLoopRegion (vs.loopStart, vs.loopEnd);
-            if (onViewStateChanged)
-                onViewStateChanged();
+            loadPresetFile (presetPaths[presetIndex]);
             return;
         }
 
@@ -575,6 +622,12 @@ private:
                 break;
             case 11:
                 showExportOptionsDialog();
+                break;
+            case 12:
+                setPresetFolderDialog();
+                break;
+            case 13:
+                StretchSettings::resetPresetDirectory();
                 break;
            #if JUCE_STANDALONE_APPLICATION
             // The custom standalone window is only visible to standalone
@@ -597,9 +650,8 @@ private:
                 break;
             case 7:
             {
-                // Deferred: resetToDefaultState() destroys/recreates the editor
-                // synchronously; never do that from inside this menu callback
-                // (which is owned by the component tree being replaced).
+                // Deferred: resetting destroys this editor synchronously,
+                // never from inside this menu callback.
                 juce::Component::SafePointer<StretchTopPanel> safeThis { this };
                 juce::MessageManager::callAsync ([safeThis]
                 {
@@ -620,34 +672,188 @@ private:
         }
     }
 
-    // "SAVE PRESET AS..." -> name-entry card -> XML in the global presets
-    // folder. Errors surface as a themed card, never an AlertWindow.
+    void setPresetFolderDialog()
+    {
+        auto chooser = std::make_shared<juce::FileChooser> (
+            "Select Preset Folder",
+            StretchPresets::presetsFolder(),
+            "");
+
+        juce::Component::SafePointer<StretchTopPanel> safeThis { this };
+        chooser->launchAsync (
+            juce::FileBrowserComponent::openMode
+                | juce::FileBrowserComponent::canSelectDirectories,
+            [safeThis, chooser] (const juce::FileChooser& fc)
+            {
+                if (safeThis == nullptr)
+                    return;
+                const juce::File result = fc.getResult();
+                if (result.isDirectory())
+                    StretchSettings::setPresetDirectory (result);
+            });
+    }
+
+    StretchPresets::ViewState currentViewState() const
+    {
+        return { processor.getWaveViewStart(), processor.getWaveViewLen(),
+                 processor.getLoopStart(), processor.getLoopEnd() };
+    }
+
+    void applyViewState (const StretchPresets::ViewState& vs)
+    {
+        processor.setWaveViewStart (vs.viewStart);
+        processor.setWaveViewLen (vs.viewLen);
+        processor.setLoopRegion (vs.loopStart, vs.loopEnd);
+        if (onViewStateChanged)
+            onViewStateChanged();
+    }
+
+    // SAVE PRESET AS card; errors show as a themed card.
     void savePresetAsDialog()
     {
         juce::Component::SafePointer<StretchTopPanel> safeThis { this };
-        StretchExportDialogs::askForName (">> SAVE PRESET", {}, this,
+        StretchExportDialogs::askForName (">> SAVE PRESET", "Enter a name for your preset:",
+                                          {}, this,
             [safeThis] (const juce::String& name)
             {
                 if (safeThis == nullptr || name.trim().isEmpty())
                     return;
 
-                StretchPresets::ViewState views;
-                views.viewStart = safeThis->processor.getWaveViewStart();
-                views.viewLen   = safeThis->processor.getWaveViewLen();
-                views.loopStart = safeThis->processor.getLoopStart();
-                views.loopEnd   = safeThis->processor.getLoopEnd();
-
-                if (! StretchPresets::save (safeThis->processor.parameters, name, views))
+                const auto& views = safeThis->currentViewState();
+                juce::String sessionName;
+                juce::File sessionFile;
+                if (! StretchPresets::saveAs (safeThis->processor.parameters, name, views,
+                                              sessionName, sessionFile,
+                                              safeThis->processor.getSourceFile().getFullPathName()))
+                {
                     StretchExportDialogs::openWindow (
                         new StretchExportDialog (">> PRESETS",
                             "Failed to save the preset.\nCheck disk space / permissions.",
                             "CLOSE", {}),
                         nullptr, 460, 200);
+                    return;
+                }
+
+                safeThis->processor.presetSession.name = sessionName;
+                safeThis->processor.presetSession.file = sessionFile;
             });
     }
 
-    // Global export options card; choices persist system-wide and are read
-    // by the next background render.
+    // Save: overwrite the current file, or Save-As when there is none.
+    void savePreset()
+    {
+        const auto& sessionFile = processor.presetSession.file;
+        if (sessionFile.getFullPathName().isNotEmpty())
+        {
+            if (! StretchPresets::saveToFile (sessionFile, processor.parameters,
+                                              currentViewState(),
+                                              processor.getSourceFile().getFullPathName()))
+                StretchExportDialogs::openWindow (
+                    new StretchExportDialog (">> PRESETS",
+                        "Failed to save the preset.\nCheck disk space / permissions.",
+                        "CLOSE", {}),
+                    nullptr, 460, 200);
+            return;
+        }
+
+        savePresetAsDialog();
+    }
+
+    // Init confirm card; full reset on INIT.
+    void initPresetDialog()
+    {
+        auto* dialog = new StretchExportDialog (">> INIT",
+            "Reset all parameters to defaults?",
+            "INIT", "CANCEL");
+        juce::Component::SafePointer<StretchTopPanel> safeThis { this };
+        dialog->onConfirm = [safeThis]
+        {
+            if (safeThis == nullptr)
+                return;
+            StretchPresets::initDefaults (safeThis->processor.parameters);
+            safeThis->processor.unloadSample();
+            safeThis->processor.setLoopRegion (0.0, 1.0);
+            safeThis->processor.setWaveViewStart (0.0);
+            safeThis->processor.setWaveViewLen (1.0);
+            safeThis->applyViewState (safeThis->currentViewState());
+            if (safeThis->onSampleUnloaded)
+                safeThis->onSampleUnloaded();
+            safeThis->processor.presetSession.name = "Untitled";
+            safeThis->processor.presetSession.file = juce::File();
+        };
+        StretchExportDialogs::openWindow (dialog, this, 500, 240);
+    }
+
+    // Full preset recall: params + view/selection + the stored sample.
+    // Missing audio skips silently; params/view still apply.
+    void loadPresetFile (const juce::File& file)
+    {
+        StretchPresets::ViewState vs;
+        juce::String sourcePath;
+        StretchPresets::load (file, processor.parameters, vs, sourcePath);
+        applyViewState (vs);
+
+        const juce::File audio (sourcePath);
+        if (audio.existsAsFile())
+            processor.loadAudioFilePreservingView (audio);
+
+        processor.presetSession.name = file.getFileNameWithoutExtension();
+        processor.presetSession.file = file;
+    }
+
+    // File browser for a single .xml preset (any folder, not just presets).
+    void loadPresetFileDialog()
+    {
+        auto chooser = std::make_shared<juce::FileChooser> (
+            "Load Preset File",
+            StretchPresets::presetsFolder(),
+            "*.xml");
+
+        juce::Component::SafePointer<StretchTopPanel> safeThis { this };
+        chooser->launchAsync (juce::FileBrowserComponent::openMode
+                                | juce::FileBrowserComponent::canSelectFiles,
+            [safeThis, chooser] (const juce::FileChooser& fc)
+            {
+                if (safeThis == nullptr)
+                    return;
+                const auto result = fc.getResult();
+                if (result.existsAsFile())
+                    safeThis->loadPresetFile (result);
+            });
+    }
+
+    // Folders of presetPaths under dir become ">> name" submenus (walked
+    // in list order, so IDs stay plain indices into presetPaths).
+    void addPresetLevel (juce::PopupMenu& parent, const juce::File& dir)
+    {
+        juce::Array<juce::File> subdirs;
+        for (int i = 0; i < presetPaths.size(); ++i)
+        {
+            const auto& f = presetPaths[i];
+            if (! f.isAChildOf (dir))
+                continue;
+            if (f.getParentDirectory() == dir)
+            {
+                parent.addItem (kPresetBaseId + i, f.getFileNameWithoutExtension());
+            }
+            else
+            {
+                auto child = f.getParentDirectory();
+                while (child.getParentDirectory() != dir)
+                    child = child.getParentDirectory();
+                if (! subdirs.contains (child))
+                    subdirs.add (child);
+            }
+        }
+        for (auto& sub : subdirs)
+        {
+            juce::PopupMenu sm;
+            addPresetLevel (sm, sub);
+            parent.addSubMenu (">> " + sub.getFileName(), sm);
+        }
+    }
+
+    // Global export options; read by the next background render.
     void showExportOptionsDialog()
     {
         const auto opts = StretchAudioProcessor::getExportOptions();
@@ -664,23 +870,29 @@ private:
             });
     }
 
-    // Menu item ids: fixed actions stay low; dynamic lists live in blocks.
+    // Preset actions ride the fixed low zone (1-13 taken by other actions).
+    static constexpr int kPresetInitId = 14;
+    static constexpr int kPresetSaveId = 15;
+    static constexpr int kPresetLoadFileId = 16;
+
+    // Menu item ids: preset block is open-ended (subfolders), the rest are
+    // small fixed blocks with wide gaps so ranges never overlap.
     static constexpr int kRecentBaseId = 100;
-    static constexpr int kPresetBaseId = 200;
-    static constexpr int kPresetSaveAsId = 300;
-    static constexpr int kRecentClearId = 400;
-    static constexpr int kZoomBaseId = 500;
+    static constexpr int kPresetBaseId = 1000;
+    static constexpr int kPresetSaveAsId = 10000;
+    static constexpr int kRecentClearId = 11000;
+    static constexpr int kZoomBaseId = 12000;
+    static constexpr int kCrtStrengthBaseId = 30;  // 30/31/32 = Low/Medium/High
 
     juce::StringArray recentPaths;      // snapshot taken when the menu opened
     juce::Array<juce::File> presetPaths;
 
     StretchAudioProcessor& processor;
     StretchHamburgerButton menuButton;
+    StretchFxTextButton presetDisplay;
     StretchExportButton exportButton;
 
-    // Bigger VT323 readout for the master gain box only. getFont() reads the
-    // current Zoom::uiScale, so the value box font follows the zoom even when
-    // the textbox is rebuilt (applyFontScale).
+    // Larger VT323 readout for the gain box; follows zoom via getFont().
     struct VolumeLookAndFeel : public StretchLookAndFeel
     {
         juce::Font getLabelFont (juce::Label&) override { return getFont (26.0f); }

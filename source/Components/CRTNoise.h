@@ -9,16 +9,8 @@ using namespace juce;
 
 #include "CRTMath.h"
 
-// ---------------------------------------------------------------------------
-// CRTNoise - procedural noise tile for the cool-retro-term noiseSource
-// sampler. 512x512 RGBA, tiled with wrap:
-//
-//   r = white noise           (vertex hsync randval)
-//   g = coherent value noise  (vertex brightness + distortion frequency)
-//   b = coherent value noise  (pixel jitter X)
-//   a = cubed white speckle   (pixel static noise + jitter Y)
-// ---------------------------------------------------------------------------
-
+// 512x512 RGBA noise tile (wraps): r white, g/b coherent value noise,
+// a cubed speckle.
 namespace crt
 {
 
@@ -27,8 +19,7 @@ inline constexpr int crtNoiseTileSize = 512;
 namespace detail
 {
 
-// One octave of wrap-around value noise: a lattice of random values at
-// `grid` resolution, smoothstep-interpolated bilinearly.
+// One wrap-around value-noise octave (smoothstep bilinear lattice).
 inline float valueNoiseOctave (const std::vector<float>& lattice, int grid,
                                float fx, float fy) noexcept
 {
@@ -41,10 +32,10 @@ inline float valueNoiseOctave (const std::vector<float>& lattice, int grid,
     const float tx = smoothstepF (0.0f, 1.0f, fractF (gx));
     const float ty = smoothstepF (0.0f, 1.0f, fractF (gy));
 
-    const float p00 = lattice[y0 * grid + x0];
-    const float p10 = lattice[y0 * grid + x1];
-    const float p01 = lattice[y1 * grid + x0];
-    const float p11 = lattice[y1 * grid + x1];
+    const float p00 = lattice[static_cast<size_t> (y0) * (size_t) grid + (size_t) x0];
+    const float p10 = lattice[static_cast<size_t> (y0) * (size_t) grid + (size_t) x1];
+    const float p01 = lattice[static_cast<size_t> (y1) * (size_t) grid + (size_t) x0];
+    const float p11 = lattice[static_cast<size_t> (y1) * (size_t) grid + (size_t) x1];
 
     return mixF (mixF (p00, p10, tx), mixF (p01, p11, tx), ty);
 }
@@ -58,7 +49,7 @@ inline void buildNoiseTile (Image& tile) noexcept
     if (tile.getWidth() != size || tile.getHeight() != size)
         tile = Image (Image::ARGB, size, size, true);
 
-    // Two octaves of coherent noise (coarse + detail) for g and b.
+    // Two octaves (coarse + detail) for g and b.
     constexpr int gridA = 16;
     constexpr int gridB = 64;
     std::vector<float> latA ((size_t) gridA * gridA);

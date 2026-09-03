@@ -9,15 +9,10 @@
 
 static const juce::String PLUGIN_NAME = "Stretch";
 
-// Taken from CMake's project(VERSION ...) via JUCE's generated plugin defines.
+// From CMake project(VERSION) via JUCE defines.
 static const juce::String PLUGIN_VERSION = JucePlugin_VersionString;
 
-// ---------------------------------------------------------------------------
-// UI zoom. The editor is always sized to STRETCH_PANEL * Zoom::uiScale;
-// everything (layout, fonts, dialogs) scales off one factor. Range is
-// 100%..300% (no shrink below the design size). Zoom::uiScale is read/written
-// on the message thread only.
-// ---------------------------------------------------------------------------
+// UI zoom: editor always STRETCH_PANEL * uiScale (100%..300%, message thread).
 namespace Zoom
 {
     inline constexpr float Min = 1.0f;
@@ -28,8 +23,7 @@ namespace Zoom
     inline float uiScale = 1.0f;
 }
 
-// Scale-aware layout metric. Instantiate with the current zoom; sc() rounds,
-// scf() keeps fractions.
+// Zoom-aware metric: sc() rounds, scf() keeps fractions.
 struct Metrics
 {
     explicit Metrics (float s = Zoom::uiScale) : scale (s) {}
@@ -40,8 +34,7 @@ struct Metrics
     float scf (float v) const { return v * scale; }
 };
 
-// Each panel derives the zoom from its own width: clamped so any transient
-// host-initiated size never pushes layout outside the permitted range.
+// Panel zoom from own width; clamped against transient host sizes.
 inline float scaleFor (const juce::Component& c)
 {
     return juce::jlimit (Zoom::Min, Zoom::Max,
@@ -52,7 +45,7 @@ namespace GUI
 {
     namespace Color
     {
-        // Green phosphor ramp — keep in visual sync with StretchColors.
+        // Keep in sync with StretchColors.
         static const juce::Colour Transparent = juce::Colour (0x00000000);
 
         static const juce::Colour Accent = juce::Colour (0xFF8AFFBE);
@@ -71,9 +64,7 @@ namespace GUI
 
     namespace Layout
     {
-        // MainMargin doubles as the edge-safety band for CRT curvature when
-        // the shader is off (with CRT on, its 5% frame adds clearance).
-        // All values scale with the current UI zoom.
+        // All scale with the UI zoom.
         inline float MainMargin()      { return 15.0f * Zoom::uiScale; }
         inline float MainGap()         { return 14.0f * Zoom::uiScale; }
         inline float CardGap()         { return 12.0f * Zoom::uiScale; }

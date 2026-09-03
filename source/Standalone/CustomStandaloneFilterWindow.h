@@ -41,7 +41,6 @@
 namespace juce
 {
 
-//==============================================================================
 /**
     An object that creates and plays a standalone instance of an AudioProcessor.
 
@@ -56,11 +55,9 @@ class StretchPluginHolder    : private AudioIODeviceCallback,
                                   private Value::Listener
 {
 public:
-    //==============================================================================
     /** Structure used for the number of inputs and outputs. */
     struct PluginInOuts   { short numIns, numOuts; };
 
-    //==============================================================================
     /** Creates an instance of the default plugin.
 
         The settings object can be a PropertySet that the class should use to store its
@@ -136,7 +133,6 @@ public:
         currentInstance = nullptr;
     }
 
-    //==============================================================================
     virtual void createPlugin()
     {
         handleCreatePlugin();
@@ -173,12 +169,10 @@ public:
         return (fileSuffix.startsWithChar ('.') ? "*" : "*.") + fileSuffix;
     }
 
-    //==============================================================================
     Value& getMuteInputValue()                           { return shouldMuteInput; }
     bool getProcessorHasPotentialFeedbackLoop() const    { return processorHasPotentialFeedbackLoop; }
     void valueChanged (Value& value) override            { muteInput = (bool) value.getValue(); }
 
-    //==============================================================================
     File getLastFile() const
     {
         File f;
@@ -260,7 +254,6 @@ public:
         });
     }
 
-    //==============================================================================
     void startPlaying()
     {
         player.setProcessor (processor.get());
@@ -279,7 +272,6 @@ public:
         player.setProcessor (nullptr);
     }
 
-    //==============================================================================
     /** Shows an audio properties dialog box modally. */
     void showAudioSettingsDialog()
     {
@@ -362,7 +354,6 @@ public:
                                   preferredSetupOptions);
     }
 
-    //==============================================================================
     void savePluginState()
     {
         if (settings != nullptr && processor != nullptr)
@@ -385,7 +376,6 @@ public:
         }
     }
 
-    //==============================================================================
     void switchToHostApplication()
     {
        #if JUCE_IOS
@@ -420,7 +410,6 @@ public:
         return currentInstance;
     }
 
-    //==============================================================================
     OptionalScopedPointer<PropertySet> settings;
     std::unique_ptr<AudioProcessor> processor;
     AudioDeviceManager deviceManager;
@@ -443,7 +432,6 @@ public:
 private:
     inline static StretchPluginHolder* currentInstance = nullptr;
 
-    //==============================================================================
     void handleCreatePlugin()
     {
         processor = createPluginFilterOfType (AudioProcessor::wrapperType_Standalone);
@@ -459,7 +447,6 @@ private:
         processor = nullptr;
     }
 
-    //==============================================================================
     class SettingsComponent : public Component
     {
     public:
@@ -541,18 +528,15 @@ private:
         }
 
     private:
-        //==============================================================================
         StretchPluginHolder& owner;
         AudioDeviceSelectorComponent deviceSelector;
         Label shouldMuteLabel;
         ToggleButton shouldMuteButton;
         bool isResizing = false;
 
-        //==============================================================================
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SettingsComponent)
     };
 
-    //==============================================================================
     void audioDeviceIOCallbackWithContext (const float* const* inputChannelData,
                                            int numInputChannels,
                                            float* const* outputChannelData,
@@ -590,7 +574,6 @@ private:
         emptyBuffer.setSize (0, 0);
     }
 
-    //==============================================================================
     void setupAudioDevices (bool enableAudioInput,
                             const String& preferredDefaultDeviceName,
                             const AudioDeviceManager::AudioDeviceSetup* preferredSetupOptions)
@@ -630,7 +613,6 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchPluginHolder)
 };
 
-//==============================================================================
 /**
     A class that can be used to run a simple standalone application containing your filter.
 
@@ -643,7 +625,6 @@ private:
 class StretchFilterWindow    : public DocumentWindow
 {
 public:
-    //==============================================================================
     typedef StretchPluginHolder::PluginInOuts PluginInOuts;
 
     StretchFilterWindow (const String& title,
@@ -708,13 +689,17 @@ public:
 
         setBoundsConstrained (windowScreenBounds);
 
-        if (auto* processor = getAudioProcessor())
-            if (auto* editor = processor->getActiveEditor())
-                setResizable (editor->isResizable(), false);
+        // The window stays logically resizable so the X11 peer keeps the
+        // windowIsResizable flag: only then does the WM publish the
+        // constrainer min/max hints (pinned to the exact size by the editor,
+        // see parentHierarchyChanged/applyZoom). Free drag-resize is still
+        // impossible — every resize path clamps to the pinned size; Zoom is
+        // the only way the size changes.
+        if (! isResizable())
+            setResizable (true, false);
        #endif
     }
 
-    //==============================================================================
     /** Creates a window with a given title and colour.
         The settings object can be a PropertySet that the class should use to
         store its settings (it can also be null). If takeOwnershipOfSettings is
@@ -759,7 +744,6 @@ public:
         pluginHolder = nullptr;
     }
 
-    //==============================================================================
     AudioProcessor* getAudioProcessor() const noexcept      { return pluginHolder->processor.get(); }
     AudioDeviceManager& getDeviceManager() const noexcept   { return pluginHolder->deviceManager; }
 
@@ -778,7 +762,6 @@ public:
         pluginHolder->startPlaying();
     }
 
-    //==============================================================================
     void closeButtonPressed() override
     {
         pluginHolder->savePluginState();
@@ -807,9 +790,13 @@ private:
        #endif
 
         setContentOwned (content, resizeAutomatically);
+        // Keep the resizable peer flag (see ctor): resetToDefaultState()
+        // recreates content on a live desktop, and losing the flag would
+        // stop the WM from publishing the pinned size hints.
+        if (! isResizable())
+            setResizable (true, false);
     }
 
-    //==============================================================================
     class MainContentComponent  : public Component,
                                   private Value::Listener,
                                   private Button::Listener,
@@ -881,7 +868,6 @@ private:
         }
 
     private:
-        //==============================================================================
         class NotificationArea : public Component
         {
         public:
@@ -928,7 +914,6 @@ private:
             TextButton settingsButton;
         };
 
-        //==============================================================================
         void inputMutedChanged (bool newInputMutedValue)
         {
             shouldShowNotification = newInputMutedValue;
@@ -956,7 +941,6 @@ private:
            #endif
         }
 
-        //==============================================================================
         void handleResized()
         {
             auto r = getLocalBounds();
@@ -1001,7 +985,6 @@ private:
             return {};
         }
 
-        //==============================================================================
         StretchFilterWindow& owner;
         NotificationArea notification;
         std::unique_ptr<AudioProcessorEditor> editor;
@@ -1043,7 +1026,6 @@ private:
         MainContentComponent* contentComponent = nullptr;
     };
 
-    //==============================================================================
     DecoratorConstrainer decoratorConstrainer;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchFilterWindow)

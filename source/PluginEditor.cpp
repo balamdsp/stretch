@@ -1,18 +1,42 @@
 #include "PluginEditor.h"
 
+// X11 standalone: _NET_FRAME_EXTENTS for outer sizing. Xlib TU is separate
+// (Xlib headers clash with JUCE); queried rarely (zoom + window settle).
+extern "C" int stretchGetFrameExtents (unsigned long windowH,
+                                       int* outFrameW, int* outFrameH);
+
+juce::Point<int> StretchAudioProcessorEditor::getNativeFrameSize (juce::Component* topLevelWindow)
+{
+    if (topLevelWindow != nullptr)
+        if (auto* peer = topLevelWindow->getPeer())
+            if (peer->getNativeHandle() != nullptr)
+            {
+                int frameW = 0, frameH = 0;
+
+                if (stretchGetFrameExtents ((unsigned long) peer->getNativeHandle(),
+                                            &frameW, &frameH) != 0)
+                    return { frameW, frameH };
+            }
+
+    return {};
+}
+
 StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor& p)
     : AudioProcessorEditor (p),
       processor (p),
       screen (p),
       crtOverlay (&screen, &p.getCrtEnabledFlag())
 {
-    static StretchLookAndFeel lookAndFeel;
-    setLookAndFeel (&lookAndFeel);
-    juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
+    static StretchLookAndFeel stretchLookAndFeel;
+    setLookAndFeel (&stretchLookAndFeel);
+    juce::LookAndFeel::setDefaultLookAndFeel (&stretchLookAndFeel);
 
     addAndMakeVisible (screen);
     addAndMakeVisible (crtOverlay);
     crtOverlay.toFront (false);
+
+    // CRT strength is machine-wide; apply the stored choice on recreate.
+    crtOverlay.setCrtStrength (processor.getCrtStrength());
 
     screen.mainPanel.waveform.onFileDropped = [this] (const juce::File& file)
     {
@@ -24,14 +48,25 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
         onSetExportFolder();
     };
 
+    screen.topPanel.onCrtStrengthChanged = [safeThis = juce::Component::SafePointer<StretchAudioProcessorEditor> (this)] (int)
+    {
+        if (safeThis == nullptr)
+            return;
+        // The processor already persisted the choice; apply it to the overlay.
+        safeThis->crtOverlay.setCrtStrength (safeThis->processor.getCrtStrength());
+    };
+
     screen.topPanel.onViewStateChanged = [this]
     {
         screen.mainPanel.waveform.restoreFromProcessor();
     };
 
-    // Loads complete off-thread; the callback arrives on the message
-    // thread. SafePointer guards the gap where this editor is destroyed
-    // while a decode is still in flight.
+    screen.topPanel.onSampleUnloaded = [this]
+    {
+        screen.mainPanel.waveform.clearBuffer();
+    };
+
+    // Loads finish off-thread; SafePointer guards editor death mid-flight.
     processor.onFileLoaded = [safeThis = juce::Component::SafePointer<StretchAudioProcessorEditor> (this)]
     {
         if (safeThis == nullptr)
@@ -49,8 +84,19 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
         });
     };
 
-    // Editor may be (re)created long after a file was loaded (host recreates
-    // UI, session reload): seed the waveform from the live processor buffer.
+    // Decode failures arrive on the message thread; surface them.
+    processor.onFileLoadFailed = [safeThis = juce::Component::SafePointer<StretchAudioProcessorEditor> (this)]
+                                 (const juce::String& reason)
+    {
+        if (safeThis == nullptr)
+            return;
+
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                                "Couldn't open audio file",
+                                                reason);
+    };
+
+    // Editor may postdate the load (host recreates UI); seed from live buffer.
     if (processor.hasLoadedFile())
     {
         screen.mainPanel.waveform.setBuffer (processor.getOriginalBuffer(),
@@ -58,8 +104,7 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
         screen.mainPanel.waveform.restoreFromProcessor();
     }
 
-    // Host state restore for an already-loaded, unchanged file reaches the
-    // editor here rather than through the async load path.
+    // State restore for an already-loaded file bypasses the async load path.
     processor.onViewStateRestored = [safeThis = juce::Component::SafePointer<StretchAudioProcessorEditor> (this)]
     {
         if (safeThis == nullptr)
@@ -74,16 +119,14 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
 
     setSize (STRETCH_PANEL_WIDTH, STRETCH_PANEL_HEIGHT);
 
-    // The window is always sized to STRETCH_PANEL * uiScale and free
-    // drag-resize is disabled; the zoom menu (and the persisted "ui_scale"
-    // APVTS param) is the only way the editor changes size. Everything scales
-    // off Zoom::uiScale via Metrics.
+    // Window always STRETCH_PANEL * uiScale; zoom menu is the only resizer.
     if (auto* scaleParam = processor.parameters.getParameter (StretchZoom::UI_SCALE_ID))
     {
-        const int idx = juce::roundToInt (scaleParam->getValue()
-                                          * (StretchZoom::ZOOM_PERCENTS.size() - 1));
-        uiScale = StretchZoom::ZOOM_PERCENTS [juce::jlimit (0,
-            (int) StretchZoom::ZOOM_PERCENTS.size() - 1, idx)] / 100.0f;
+        const float f = scaleParam->getValue()
+                        * (float) (StretchZoom::ZOOM_PERCENTS.size() - 1);
+        const int idx = juce::roundToInt (f);
+        uiScale = StretchZoom::ZOOM_PERCENTS [static_cast<size_t> (juce::jlimit (0,
+            (int) StretchZoom::ZOOM_PERCENTS.size() - 1, idx))] / 100.0f;
     }
 
     processor.parameters.addParameterListener (StretchZoom::UI_SCALE_ID, this);
@@ -91,9 +134,8 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
     updateZoomLimits();
     applyZoom (uiScale);
 
-    // Standalone startup-fit race: the wrapper's initial layout pass clamps
-    // the editor back to its resize minimum, silently discarding the zoom
-    // applied here. Re-assert the zoom once the window has settled.
+    // Standalone startup race: the wrapper clamps back to resize minimum,
+    // discarding this zoom. Re-assert once settled.
     if (processor.isRunningAsStandalone())
         juce::Timer::callAfterDelay (250, [safeThis = juce::Component::SafePointer<StretchAudioProcessorEditor> (this)]
         {
@@ -105,6 +147,11 @@ StretchAudioProcessorEditor::StretchAudioProcessorEditor (StretchAudioProcessor&
 StretchAudioProcessorEditor::~StretchAudioProcessorEditor()
 {
     processor.parameters.removeParameterListener (StretchZoom::UI_SCALE_ID, this);
+
+    // Detach callbacks so late workers can't paint a dead UI (reopen seeds).
+    processor.onFileLoaded = nullptr;
+    processor.onFileLoadFailed = nullptr;
+    processor.onViewStateRestored = nullptr;
 }
 
 void StretchAudioProcessorEditor::parameterChanged (const juce::String& parameterID, float /*newValue*/)
@@ -117,9 +164,9 @@ void StretchAudioProcessorEditor::parameterChanged (const juce::String& paramete
         return;
 
     const int idx = juce::roundToInt (scaleParam->getValue()
-                                      * (StretchZoom::ZOOM_PERCENTS.size() - 1));
-    applyZoom (StretchZoom::ZOOM_PERCENTS [juce::jlimit (0,
-        (int) StretchZoom::ZOOM_PERCENTS.size() - 1, idx)] / 100.0f);
+                                      * (float) (StretchZoom::ZOOM_PERCENTS.size() - 1));
+    applyZoom (StretchZoom::ZOOM_PERCENTS [static_cast<size_t> (juce::jlimit (0,
+        (int) StretchZoom::ZOOM_PERCENTS.size() - 1, idx))] / 100.0f);
 }
 
 void StretchAudioProcessorEditor::applyZoom (float scale)
@@ -131,16 +178,32 @@ void StretchAudioProcessorEditor::applyZoom (float scale)
     applyScaledFonts();
     updateZoomLimits();
 
-    setSize (juce::roundToInt (Zoom::BaseW * uiScale),
-             juce::roundToInt (Zoom::BaseH * uiScale));
+    const int pixW = juce::roundToInt (Zoom::BaseW * uiScale);
+    const int pixH = juce::roundToInt (Zoom::BaseH * uiScale);
 
-    // Standalone: follow the editor size exactly (native title bar keeps the
-    // OS frame outside the client, so the content area == editor bounds).
+    // X11: frame lives inside the outer window, so add it back; the client
+    // then lands exactly on the editor size (peer frame size stays empty).
+    const auto frame = getNativeFrameSize (processor.isRunningAsStandalone()
+                                           ? getTopLevelComponent() : nullptr);
+
+    const int outerW = juce::jmax (1, pixW + frame.x);
+    const int outerH = juce::jmax (1, pixH + frame.y);
+
+    // Refresh the window pin BEFORE resizing (WM publishes pinned min==max).
     if (processor.isRunningAsStandalone())
         if (auto* tl = getTopLevelComponent())
             if (tl != this)
-                tl->setSize (juce::roundToInt (Zoom::BaseW * uiScale),
-                             juce::roundToInt (Zoom::BaseH * uiScale));
+                if (auto* rw = dynamic_cast<juce::ResizableWindow*> (tl))
+                    if (auto* c = rw->getConstrainer())
+                        c->setSizeLimits (outerW, outerH, outerW, outerH);
+
+    setSize (pixW, pixH);
+
+    // Follow the editor size exactly (outer == editor + frame).
+    if (processor.isRunningAsStandalone())
+        if (auto* tl = getTopLevelComponent())
+            if (tl != this)
+                tl->setSize (outerW, outerH);
 
     resized();
     repaint();
@@ -148,19 +211,26 @@ void StretchAudioProcessorEditor::applyZoom (float scale)
 
 void StretchAudioProcessorEditor::updateZoomLimits()
 {
-    setResizeLimits (juce::roundToInt (Zoom::BaseW * Zoom::Min),
-                     juce::roundToInt (Zoom::BaseH * Zoom::Min),
-                     juce::roundToInt (Zoom::BaseW * Zoom::Max),
-                     juce::roundToInt (Zoom::BaseH * Zoom::Max));
+    // Standalone: pin constrainer to the zoom size (edge-drag clamp + WM
+    // hints). Hosts keep the zoom range for host-managed sizing.
+    if (processor.isRunningAsStandalone())
+        setResizeLimits (juce::roundToInt (Zoom::BaseW * uiScale),
+                         juce::roundToInt (Zoom::BaseH * uiScale),
+                         juce::roundToInt (Zoom::BaseW * uiScale),
+                         juce::roundToInt (Zoom::BaseH * uiScale));
+    else
+        setResizeLimits (juce::roundToInt (Zoom::BaseW * Zoom::Min),
+                         juce::roundToInt (Zoom::BaseH * Zoom::Min),
+                         juce::roundToInt (Zoom::BaseW * Zoom::Max),
+                         juce::roundToInt (Zoom::BaseH * Zoom::Max));
 
     setResizable (false, false);
 }
 
 void StretchAudioProcessorEditor::applyScaledFonts()
 {
-    // Ctrl labels and the volume box carry an explicit setFont()/textbox size
-    // (not L&F-driven), so they need a re-set on zoom. Everything else
-    // (value boxes, combos) re-reads the L&F via lookAndFeelChanged() below.
+    // Labels/boxes with explicit fonts need re-set on zoom; the rest
+    // re-reads the L&F via lookAndFeelChanged().
     screen.mainPanel.controls.applyFontScale (uiScale);
     screen.topPanel.applyFontScale (uiScale);
 
@@ -209,16 +279,12 @@ void StretchAudioProcessorEditor::onFileDropped (const juce::File& file)
     processor.loadAudioFile (file);
 }
 
-// Keyboard shortcuts: Space = play/pause, L = loop, F = freeze, R = reverse.
-// Cards ride APVTS attachments, so driving the processor directly keeps
-// every button visual in sync.
-//
-// Host-side Space handling DECISION: keys stay best-effort inside hosts
-// (some intercept Space for their own transport) and are only guaranteed in
-// the Standalone build. Documented in the About card.
+// Shortcuts: Space play/pause, L loop, F freeze, R reverse. Processor-direct
+// keeps button visuals in sync. Space is best-effort in hosts (guaranteed
+// standalone only).
 bool StretchAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
 {
-    // Never steal keys from an open value-box edit field.
+    // Never steal keys from a value-box edit field.
     if (auto* focused = juce::Component::getCurrentlyFocusedComponent();
         focused != nullptr && dynamic_cast<juce::TextEditor*> (focused) != nullptr)
         return false;

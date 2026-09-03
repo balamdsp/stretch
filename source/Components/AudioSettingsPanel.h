@@ -72,7 +72,7 @@ private:
             dw->closeButtonPressed();
     }
 
-    // Smaller fonts than the main L&F: the device selector is dense.
+    // Smaller fonts: the device selector is dense.
     struct SettingsLookAndFeel : public StretchLookAndFeel
     {
         juce::Font getComboBoxFont (juce::ComboBox&) override
@@ -86,7 +86,7 @@ private:
         }
 
         void drawButtonText (juce::Graphics& g, juce::TextButton& button,
-                             bool shouldDrawButtonAsHighlighted, bool isButtonDown) override
+                             bool shouldDrawButtonAsHighlighted, [[maybe_unused]] bool isButtonDown) override
         {
             using namespace StretchColors;
 
@@ -153,11 +153,8 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioSettingsPanel)
 };
 
-// Non-modal wrapper window for the audio settings panel.
-// Avoids the modal DialogWindow mouse-tracking bug where hover
-// feedback never appears because JUCE's mouse input source
-// doesn't update its cached peer/position for a stationary cursor
-// over a freshly-opened modal dialog.
+// Non-modal wrapper (modal DialogWindow kills hover feedback: stale cached
+// mouse peer/position under a stationary cursor).
 class SettingsWindow : public juce::DocumentWindow
 {
 public:

@@ -4,9 +4,7 @@
 
 namespace StretchColors
 {
-    // Green phosphor palette (Pip-Boy / Fairlight style): dark green-black
-    // surfaces, mid greens for dim states, main phosphor #8AFFBE, and
-    // near-white highlights that keep just enough hue to stay in family.
+    // Green phosphor palette (Pip-Boy / Fairlight style).
     static const juce::Colour background{0xff061410};
     static const juce::Colour body{0xff081711};
     static const juce::Colour card{0xff10241a};
@@ -35,11 +33,7 @@ namespace StretchColors
     static const juce::Colour menuInnerBorder{0xff123023};
 }
 
-// ---------------------------------------------------------------------------
-// StretchTitleBarButton - flat terminal-style minimise / maximise / close
-// glyph button for JUCE-drawn document window title bars (V4's own buttons
-// key off its static LIGHT colour scheme, which would paint them white).
-// ---------------------------------------------------------------------------
+// Flat terminal glyph button for JUCE-drawn title bars (V4 defaults paint white).
 class StretchTitleBarButton : public juce::Button
 {
 public:
@@ -82,12 +76,7 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StretchTitleBarButton)
 };
 
-// ---------------------------------------------------------------------------
-// StretchSliderTextBoxLabel - slider value box: re-assert the font whenever
-// the L&F changes, and keep the mouse wheel from hijacking the box.
-// Selection colour is sourced from Slider::textBoxHighlightColourId
-// in createSliderTextBox below.
-// ---------------------------------------------------------------------------
+// Slider value box: fixed font, wheel-proof; edit text centred.
 class StretchSliderTextBoxLabel : public juce::Label
 {
 public:
@@ -126,19 +115,27 @@ public:
         return typeface;
     }
 
+    // DirectWrite renders smaller than FreeType; match Linux size.
+   #if JUCE_WINDOWS
+    static constexpr float kFontSizeScale = 1.15f;
+   #else
+    static constexpr float kFontSizeScale = 1.0f;
+   #endif
+
     static juce::Font makeFont (float height)
     {
-        return juce::Font (getTypeface()).withHeight (height);
+        // Pin legacy metrics: JUCE 9 default metrics render larger at the
+        // same height, breaking the designed layout.
+        return juce::Font (juce::FontOptions (getTypeface())
+                               .withMetricsKind (juce::TypefaceMetricsKind::legacy))
+            .withHeight (height * kFontSizeScale);
     }
 
     StretchLookAndFeel()
     {
         using namespace StretchColors;
 
-        // Swap V4's default LIGHT scheme for midnight BEFORE our palette:
-        // any widget that reads the scheme directly (instead of colour IDs)
-        // then falls back to muted dark grays instead of white/teal, and IDs
-        // we never set explicitly resolve to dark values too.
+        // Midnight first: widgets reading V4's LIGHT scheme fall back dark.
         setColourScheme (getMidnightColourScheme());
 
         setColour(juce::ResizableWindow::backgroundColourId, background);
@@ -198,27 +195,24 @@ public:
     {
         if (getTypeface() != nullptr)
             return makeFont (height * Zoom::uiScale);
-        return juce::Font(juce::Font::getDefaultSansSerifFontName(), height * Zoom::uiScale, juce::Font::plain);
+        return juce::Font (juce::FontOptions (
+            juce::Font::getDefaultSansSerifFontName(), height * Zoom::uiScale * kFontSizeScale, juce::Font::plain)
+                               .withMetricsKind (juce::TypefaceMetricsKind::legacy));
     }
 
     juce::Font getCustomFont(float height, bool = true) const { return getFont(height); }
 
     juce::Font getLabelFont(juce::Label &label) override
     {
-        // Slider value boxes (and their inline editors) use the same size as
-        // the displayed values -- a smaller font here made double-click
-        // editing shrink the text.
+        // Same size for display + inline editor (smaller shrank edits).
         if (label.findParentComponentOfClass<juce::Slider>() != nullptr)
             return getFont(26.0f);
         return getFont(26.0f);
     }
 
-    // Force the same readable font onto the value-box label AND its editing
-    // TextEditor so double-click edits never crop glyphs.
+    // Same font on box + editor so edits never crop glyphs.
     juce::Label* createSliderTextBox (juce::Slider& slider) override
     {
-        // Every colour (including the edit-selection highlight) is sourced from
-        // the slider's own textBox* IDs, so it always lands in grayscale.
         auto *l = new StretchSliderTextBoxLabel();
         l->setJustificationType (juce::Justification::centred);
         l->setKeyboardType (juce::TextInputTarget::decimalKeyboard);
@@ -245,8 +239,7 @@ public:
     juce::Font getAlertWindowMessageFont() override { return getFont(26.0f, false); }
     int getAlertWindowButtonHeight() override { return juce::roundToInt (34.0f * Zoom::uiScale); }
 
-    // Alert window (popups): dark CRT box + scanlines + mono glow frame,
-    // with padded, centered message text.
+    // Dark CRT alert box + mono glow frame; text padded, top-anchored.
     void drawAlertBox (juce::Graphics& g, juce::AlertWindow& alert,
                        const juce::Rectangle<int>& textArea,
                        juce::TextLayout& textLayout) override
@@ -255,11 +248,10 @@ public:
 
         const auto bounds = alert.getLocalBounds();
 
-        // Dark body (one step lighter than the panels so the scanlines show).
+        // Dark body (scanlines show); glow frame; text padded, top-anchored.
         g.setColour (card);
         g.fillRect (bounds);
 
-        // Scanlines.
         g.setColour (juce::Colours::black.withAlpha (0.28f));
         for (int y = 0; y < bounds.getHeight(); y += 2)
             g.fillRect (0, y, bounds.getWidth(), 1);
@@ -270,8 +262,7 @@ public:
         g.setColour (accentDim);
         g.drawRect (1, 1, bounds.getWidth() - 2, bounds.getHeight() - 2, 1);
 
-        // Message text: padded area, anchored to the top so it stays clear of
-        // the buttons at the bottom.
+        // Padded, top-anchored (clear of the buttons).
         const auto padded = textArea.reduced (juce::roundToInt (24.0f * Zoom::uiScale),
                                               juce::roundToInt (6.0f * Zoom::uiScale));
         if (padded.isEmpty())
@@ -285,12 +276,7 @@ public:
                                                   juce::jmin (padded.getHeight(), (int) layoutHeight)).toFloat());
     }
 
-    // -------------------------------------------------------------------------
-    // Document window chrome: every popup with a JUCE title bar (Audio/MIDI
-    // Settings, About, export cards) shares one dark bar + white VT323 title.
-    // V4's defaults key off its static LIGHT colour scheme, which would
-    // render a white bar with black text and traffic-light buttons.
-    // -------------------------------------------------------------------------
+    // Dark title bar + white VT323 title (V4 defaults render white/black).
     void drawDocumentWindowTitleBar (juce::DocumentWindow& window,
                                      juce::Graphics& g,
                                      int w, int h,
@@ -305,8 +291,7 @@ public:
         juce::Font font = makeFont ((float) h * 0.65f);
         g.setFont (font);
 
-        // Measure the title, then centre it in the bar (clamped to the
-        // button-free zone).
+        // Centre the title in the button-free zone.
         auto textW = juce::GlyphArrangement::getStringWidthInt (font, window.getName());
         int iconW = 0;
         int iconH = 0;
@@ -436,7 +421,6 @@ public:
         auto bounds = slider.getLocalBounds();
         if (slider.isRotary())
         {
-            // Value box centred BELOW the knob, full-width strip.
             auto textBoxStrip = bounds.removeFromBottom(24);
             layout.textBoxBounds = textBoxStrip.withSizeKeepingCentre(
                 juce::jmin(96, textBoxStrip.getWidth()), 22);
@@ -444,11 +428,8 @@ public:
         }
         else if (slider.isHorizontal())
         {
-            // Value box hugs the top of the strip (trimmed at the bottom) so
-            // the VT323 digits optically align with the track: the parent
-            // sliders are laid out taller than their visible track precisely
-            // to give this box headroom. Never translate the box above the
-            // component bounds -- that clips glyph tops.
+            // Trimmed at the bottom to centre on the track; never above
+            // component bounds (clips glyph tops).
             layout.textBoxBounds = bounds.removeFromRight (juce::roundToInt (124.0f * Zoom::uiScale))
                                           .withTrimmedBottom (juce::roundToInt (5.0f * Zoom::uiScale));
             layout.sliderBounds = bounds.reduced(4, 0);
@@ -513,7 +494,6 @@ public:
             g.setColour(accentDim);
             g.fillRect(track);
 
-            // No highlight blob at minimum value.
             const float fillW = sliderPos - track.getX();
             if (fillW > 0.5f)
             {
@@ -575,7 +555,8 @@ public:
                     : isOn ? textPrimary : (shouldDrawButtonAsHighlighted ? textPrimary : textMid));
         const juce::String text = isOn ? ("> " + button.getButtonText() + " <")
                                        : ("[ " + button.getButtonText() + " ]");
-        g.drawText(text, area.translated(0, -juce::roundToInt (2.0f * Zoom::uiScale)), juce::Justification::centred, true);
+        // Plain centred: caps-only ink centres itself; the old -2px sat high.
+        g.drawText(text, area, juce::Justification::centred, true);
     }
 
     void drawToggleButton(juce::Graphics& g, juce::ToggleButton& button,
