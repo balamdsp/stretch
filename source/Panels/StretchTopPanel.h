@@ -403,7 +403,7 @@ private:
 
         StretchExportDialogs::openWindow (
             new StretchExportDialog (">> ABOUT STRETCH", aboutMessage, "CLOSE", {}),
-            nullptr, 500, 600);
+            nullptr, 640, 700);
     }
 
     // Preset-only popup for the name display (not the full hamburger menu).
@@ -763,8 +763,8 @@ private:
     void initPresetDialog()
     {
         auto* dialog = new StretchExportDialog (">> INIT",
-            "Reset all parameters to defaults?",
-            "INIT", "CANCEL");
+            "Are you sure you want to initialize this preset?",
+            "Confirm", "Cancel");
         juce::Component::SafePointer<StretchTopPanel> safeThis { this };
         dialog->onConfirm = [safeThis]
         {

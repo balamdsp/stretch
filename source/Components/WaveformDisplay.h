@@ -104,7 +104,7 @@ public:
         {
             g.setColour (GUI::Color::Logo.withAlpha (0.28f));
             g.setFont (StretchLookAndFeel::makeFont (22.0f * s));
-            g.drawText ("> DROP AUDIO FILE HERE <",
+            g.drawText ("> DROP AUDIO OR CLICK HERE <",
                         innerBounds, juce::Justification::centred, false);
             return;
         }
